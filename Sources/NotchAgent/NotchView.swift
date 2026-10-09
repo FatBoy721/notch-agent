@@ -532,10 +532,15 @@ struct HeaderIcons: View {
 /// The gear: Settings, the one toggle people flip often, and Quit.
 struct SettingsMenu: View {
     @ObservedObject var store: Store
+    @ObservedObject private var updater = Updater.shared
     @AppStorage(Store.dropOnFinishKey) private var dropOnFinish = true
 
     var body: some View {
         Menu {
+            if let release = updater.available {
+                Button("Install Notch Agent \(release.version)…") { updater.install() }
+                Divider()
+            }
             Button("Settings…") { SettingsWindow.shared.show() }
             Divider()
             Toggle("Drop down when agents finish", isOn: $dropOnFinish)
@@ -547,6 +552,14 @@ struct SettingsMenu: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+        // A dot while an update waits. On the menu, not in its label: the
+        // label is drawn as a plain image, without overlays.
+        .overlay(alignment: .topTrailing) {
+            if updater.available != nil {
+                Circle().fill(Palette.ok).frame(width: 6, height: 6).offset(x: 3, y: -2).allowsHitTesting(false)
+            }
+        }
+        .help(updater.available.map { "Notch Agent \($0.version) is ready to install" } ?? "")
     }
 }
 

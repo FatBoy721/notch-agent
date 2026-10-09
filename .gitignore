@@ -3,3 +3,4 @@
 *.app/
 build/
 .omc/
+.DS_Store

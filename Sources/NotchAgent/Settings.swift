@@ -216,7 +216,7 @@ private struct Sidebar: View {
                 }
             }
             Spacer()
-            Text("Version \(Updates.currentVersion)")
+            Text("Version \(Updater.currentVersion)")
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.secondary)
                 .padding(12)
@@ -939,66 +939,33 @@ private struct MusicSettingsPage: View {
 
 // MARK: - About
 
-/// Update checks against the app's GitHub releases. No repository yet, so
-/// the button says so; set `repository` ("owner/name") when there is one.
-enum Updates {
-    static let repository: String? = nil
-
-    enum Result {
-        case notSetUp, upToDate(String), available(version: String, page: URL), failed(String)
-    }
-
-    static var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
-    }
-
-    static func check() async -> Result {
-        guard let repository, let url = URL(string: "https://api.github.com/repos/\(repository)/releases/latest") else { return .notSetUp }
-        var request = URLRequest(url: url, timeoutInterval: 10)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let release = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tag = release["tag_name"] as? String,
-              let page = (release["html_url"] as? String).flatMap(URL.init(string:)) else {
-            return .failed("Couldn't reach GitHub. Try again later.")
-        }
-        let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        return latest.compare(currentVersion, options: .numeric) == .orderedDescending
-            ? .available(version: latest, page: page) : .upToDate(currentVersion)
-    }
-}
-
 private struct AboutSettingsPage: View {
     private static let log = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/NotchAgent.log")
-    @State private var update: Updates.Result?
-    @State private var checking = false
+    @ObservedObject private var updater = Updater.shared
 
     var body: some View {
         HStack(spacing: 16) {
             SettingsLogo(size: 64)
             VStack(alignment: .leading, spacing: 3) {
                 Text("Notch Agent").font(.system(size: 22, weight: .bold))
-                Text("Version \(Updates.currentVersion)").font(.system(size: 13)).foregroundStyle(Theme.secondary)
+                Text("Version \(Updater.currentVersion)").font(.system(size: 13)).foregroundStyle(Theme.secondary)
                 Text("Your coding agents, music and Hermes, in the notch.").font(.system(size: 13)).foregroundStyle(Theme.secondary)
             }
         }
-        SettingsSection(title: "Updates") {
+        SettingsSection(title: "Updates", footer: "Checked once a day from GitHub. Installing replaces the app and reopens it; your settings stay.") {
             SettingsRow(title: "Check for updates", subtitle: updateText) {
-                Button(checking ? "Checking…" : "Check now") {
-                    checking = true
-                    Task {
-                        update = await Updates.check()
-                        checking = false
-                    }
-                }
-                .buttonStyle(PillButtonStyleSettings(prominent: true))
-                .disabled(checking)
+                Button(updater.state == .checking ? "Checking…" : "Check now") { Task { await updater.check() } }
+                    .buttonStyle(PillButtonStyleSettings(prominent: updater.available == nil))
+                    .disabled(updater.state == .checking || updater.state == .downloading || updater.state == .installing)
             }
-            if case .available(_, let page) = update {
-                SettingsRow(title: "Download the new version") {
-                    LinkButton(title: "Open ↗") { NSWorkspace.shared.open(page) }
+            if let release = updater.available {
+                SettingsRow(title: "Version \(release.version) is ready", subtitle: "Downloads, swaps itself in and reopens") {
+                    HStack(spacing: 12) {
+                        LinkButton(title: "What's new ↗") { NSWorkspace.shared.open(release.page) }
+                        Button("Download & install") { updater.install() }
+                            .buttonStyle(PillButtonStyleSettings(prominent: true))
+                    }
                 }
             }
         }
@@ -1018,12 +985,14 @@ private struct AboutSettingsPage: View {
     }
 
     private var updateText: String? {
-        switch update {
-        case nil: nil
-        case .notSetUp?: "Updates aren't set up yet. They'll come from GitHub once Notch Agent has a page there."
-        case .upToDate(let version)?: "You're up to date (\(version))."
-        case .available(let version, _)?: "Version \(version) is available."
-        case .failed(let message)?: message
+        switch updater.state {
+        case .idle: nil
+        case .checking: "Asking GitHub…"
+        case .upToDate: "You're up to date (\(Updater.currentVersion))."
+        case .available(let release): "Version \(release.version) is available."
+        case .downloading: "Downloading…"
+        case .installing: "Installing; Notch Agent reopens in a moment."
+        case .failed(let message): message
         }
     }
 }

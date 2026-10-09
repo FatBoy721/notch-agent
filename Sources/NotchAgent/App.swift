@@ -68,6 +68,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         LoginItem.enableOnFirstLaunch()
         SetupWindow.shared.showIfNeeded(returningUser: returningUser)
+        Updater.shared.onFound = { [store] release in
+            store.announce("Notch Agent \(release.version) is out. Install it from the ⚙ menu.")
+        }
+        Updater.shared.startAutomaticChecks()
         do {
             try server.start()
             self.server = server
