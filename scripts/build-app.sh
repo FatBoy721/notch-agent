@@ -9,13 +9,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP=build/NotchAgent.app
-swift build -c release
+# One universal binary: runs natively on Apple Silicon and Intel Macs.
+ARCHS=(--arch arm64 --arch x86_64)
+swift build -c release "${ARCHS[@]}"
+BIN=$(swift build -c release "${ARCHS[@]}" --show-bin-path)
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/release/NotchAgent "$APP/Contents/MacOS/"
+cp "$BIN/NotchAgent" "$APP/Contents/MacOS/"
 cp packaging/Info.plist "$APP/Contents/"
-[ -f build/AppIcon.icns ] || swift scripts/make-icon.swift build
+# Remade whenever the logo changes.
+[ build/AppIcon.icns -nt packaging/brand/notch-agent.png ] || swift scripts/make-icon.swift build
 cp build/AppIcon.icns "$APP/Contents/Resources/"
+# Logos of the services it connects to (Hermes, OpenClaw).
+cp packaging/brand/*.png "$APP/Contents/Resources/"
 
 IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/Developer ID Application|Apple Development/ { print $2; exit }')}"
 codesign --force --sign "${IDENTITY:--}" --timestamp=none "$APP"

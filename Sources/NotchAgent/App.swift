@@ -27,7 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         notch = NotchController(store: store, services: services)
+        SettingsWindow.shared.configure(store: store, services: services)
+        SetupWindow.shared.configure(store: store, ui: notch?.ui)
+        // Read before the login item marks this launch as seen.
+        let returningUser = UserDefaults.standard.bool(forKey: LoginItem.firstLaunchKey)
         services.music.start()
+        // Ready for the usage peek on the first hover.
+        services.limits.refresh()
         herdr.start { [store] snapshot in
             Task { @MainActor in store.applyHerdr(snapshot) }
         }
@@ -35,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in store.applyProcesses(readings) }
         }
         store.watchTerminals()
+        store.watchHermes()
         let server = HookServer { [store] payload, reply in
             Task { @MainActor in store.handle(payload, reply: reply) }
         }
@@ -47,8 +54,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { cache.data = Self.debugJSON(store: store, ui: notch?.ui, services: services) }
         }
         StallWatch.start()
+        // Testing aid: open Settings at launch while this file exists; it
+        // may name the tab ("agents", "music"…).
+        if let tab = try? String(contentsOfFile: "/tmp/notch-agent-open-settings", encoding: .utf8) {
+            SettingsWindow.shared.show(SettingsWindow.Tab(rawValue: tab.trimmingCharacters(in: .whitespacesAndNewlines)) ?? .general)
+        }
+        // And the setup window, as a new user would see it.
+        if FileManager.default.fileExists(atPath: "/tmp/notch-agent-open-setup") { SetupWindow.shared.show() }
         #endif
+        server.spotifyCallback = { [services] query in
+            Task { @MainActor in services.music.finishSpotifyLogin(query) }
+            return SpotifyAPI.callbackPage(for: query)
+        }
         LoginItem.enableOnFirstLaunch()
+        SetupWindow.shared.showIfNeeded(returningUser: returningUser)
         do {
             try server.start()
             self.server = server
@@ -62,8 +81,9 @@ extension AppDelegate {
     static func debugJSON(store: Store, ui: NotchUI?, services: Services) -> Data {
         let sessions = store.orderedSessions.map { session -> [String: Any] in
             ["id": session.id, "title": session.title, "status": "\(session.status)", "kind": session.kind.name,
-             "model": session.model ?? "", "runningTool": session.runningTool?.tool ?? "", "herdr": session.herdr?.paneID ?? "", "reply": String((session.lastReply ?? "").prefix(80)),
-             "fromHooks": session.fromHooks]
+             "model": session.model ?? "", "context": session.contextTokens ?? -1, "runningTool": session.runningTool?.tool ?? "", "herdr": session.herdr?.paneID ?? "", "reply": String((session.lastReply ?? "").prefix(80)),
+             "fromHooks": session.fromHooks, "where": session.terminalName,
+             "waitedMinutes": session.waitingSince.map { Int(Date().timeIntervalSince($0) / 60) } as Any]
         }
         var snapshot: [String: Any] = ["tab": "\(store.tabStatus)", "approvals": store.approvals.count, "sessions": sessions,
                                        "askAttachments": services.ask.attachments.map(\.url.lastPathComponent),
@@ -78,6 +98,14 @@ extension AppDelegate {
             snapshot["frames"] = ["shape": "\(ui.shapeProbe.screenFrame ?? .zero)", "dock": "\(ui.dockProbe.screenFrame ?? .zero)"]
             snapshot["notch"] = ["width": ui.notchSize.width, "height": ui.notchSize.height]
         }
+        let music = services.music
+        snapshot["music"] = ["player": music.nowPlaying?.player.rawValue ?? "", "panel": music.panel.map { "\($0)" } ?? "",
+                             "spotify": "\(music.spotify)", "upNext": music.upNext?.map(\.title) as Any,
+                             "liked": music.nowPlaying?.favorite as Any, "likeNeedsPermission": music.likeNeedsPermission,
+                             "browse": ["query": music.browser.query, "results": music.browser.results?.map(\.title) as Any,
+                                        "playlists": music.browser.playlists?.count as Any, "liked": music.browser.likedSongs?.count as Any,
+                                        "playlistsNeedPermission": music.browser.playlistsNeedPermission,
+                                        "problem": music.browser.problem as Any]]
         return (try? JSONSerialization.data(withJSONObject: snapshot, options: [.prettyPrinted])) ?? Data()
     }
 }
@@ -93,8 +121,11 @@ enum LoginItem {
         if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
     }
 
+    /// Set at the end of the first launch; setup also reads it.
+    static let firstLaunchKey = "didEnableLoginItemOnFirstLaunch"
+
     static func enableOnFirstLaunch() {
-        let key = "didEnableLoginItemOnFirstLaunch"
+        let key = firstLaunchKey
         guard isAvailable, !UserDefaults.standard.bool(forKey: key) else { return }
         UserDefaults.standard.set(true, forKey: key)
         try? set(true)
@@ -217,7 +248,7 @@ final class NotchUI: ObservableObject {
 }
 
 /// Owns the borderless panel over the notch (a tab at the top of the menu
-/// bar on Macs without one). Hover peeks, click or ⌥Space opens, and an
+/// bar on Macs without one). Hover peeks, click or the Ask shortcut opens, and an
 /// agent asking for permission opens it by itself.
 @MainActor
 final class NotchController {
@@ -260,11 +291,15 @@ final class NotchController {
         // Testing aid: pretend nobody is at the Mac while this file exists.
         if FileManager.default.fileExists(atPath: "/tmp/notch-agent-force-away") { return true }
         #endif
-        return displaysAsleep || screenLocked || idleSeconds > 20
+        // Only truly away: sitting still to read or watch isn't. Counting
+        // 20 s without input as "away" held finished-turn cards down for
+        // people who were right there.
+        return displaysAsleep || screenLocked
     }
     private var previousBounds: (rect: NSRect, until: Date)?
     private var hotKey: HotKey?
     private var timer: Timer?
+    private var monitors: [Any] = []
     private var subscriptions: Set<AnyCancellable> = []
 
     init(store: Store, services: Services) {
@@ -280,7 +315,7 @@ final class NotchController {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
-        panel.contentView = NSHostingView(rootView: NotchView(store: store, ui: ui, services: services))
+        panel.contentView = NSHostingView(rootView: NotchView(store: store, ui: ui, services: services).steadyGlass())
         panel.onCancel = { [weak self] in self?.ui.mode = .closed }
 
         layout()
@@ -343,6 +378,7 @@ final class NotchController {
                 }
                 EventLog.write("drop shown for \(drop.sessionID.prefix(8)) (+\(drop.others.count) others), away=\(Self.userAway)")
                 self.dropShownAt = Date()
+                self.dropHoveredAt = .distantPast
                 self.dropDuration = 6
                 self.dropWaitedForUser = false
                 self.ui.mode = .drop
@@ -354,16 +390,26 @@ final class NotchController {
             if self.ui.isOpen {
                 self.ui.mode = .closed
             } else {
-                // ⌥Space is "ask an agent": open on Ask with the keyboard ready.
+                // The Ask shortcut: open on Ask with the keyboard ready.
                 self.ui.page = .ask
                 self.open(pin: .hotKey)
                 self.panel.makeKey()
             }
         }
 
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+        // Closed, the notch only cares when the pointer moves, so it listens
+        // for mouse moves instead of a 30 Hz timer that woke the app all day.
+        // Open, peeking or dropped down it also runs on a timer (timeouts,
+        // the panel moving under a still pointer).
+        let moves: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: moves, handler: { [weak self] _ in
             MainActor.assumeIsolated { self?.trackMouse() }
-        }
+        }) { monitors.append(global) }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: moves, handler: { [weak self] event in
+            MainActor.assumeIsolated { self?.trackMouse() }
+            return event
+        }) { monitors.append(local) }
+        updateTimer(for: ui.mode)
     }
 
     private func layout() {
@@ -394,6 +440,7 @@ final class NotchController {
     }
 
     private func modeChanged(to mode: NotchUI.Mode) {
+        updateTimer(for: mode)
         if lastMode == .drop && mode != .drop { EventLog.write("drop ended: notch now \(mode)") }
         lastMode = mode
         if mode != .drop { store.dismissDrop() }
@@ -407,6 +454,24 @@ final class NotchController {
             panel.orderOut(nil)
             panel.orderFrontRegardless()
         }
+    }
+
+    private func updateTimer(for mode: NotchUI.Mode) {
+        if mode == .closed {
+            timer?.invalidate()
+            timer = nil
+        } else if timer == nil {
+            let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.trackMouse() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.timer = timer
+        }
+    }
+
+    /// Only when it changes: mouse moves now call in at up to 120 Hz.
+    private func setTakesMouse(_ takes: Bool) {
+        if panel.ignoresMouseEvents == takes { panel.ignoresMouseEvents = !takes }
     }
 
     /// Hit testing by hand: the window is much bigger than what it draws,
@@ -425,7 +490,7 @@ final class NotchController {
 
         switch ui.mode {
         case .closed:
-            panel.ignoresMouseEvents = true
+            setTakesMouse(false)
             if hotZone.contains(mouse) {
                 // Dragging something over the notch opens it to drop into.
                 ui.mode = NSEvent.pressedMouseButtons & 1 != 0 ? .open : .peek
@@ -434,19 +499,19 @@ final class NotchController {
             let switchArea = NSRect(x: mid - ui.switchSize.width / 2, y: shape.minY - NotchUI.dockGap - ui.switchSize.height,
                                     width: ui.switchSize.width, height: ui.switchSize.height + NotchUI.dockGap)
             let inside = hotZone.insetBy(dx: -4, dy: -6).contains(mouse) || switchArea.insetBy(dx: -8, dy: -4).contains(mouse)
-            panel.ignoresMouseEvents = !inside
+            setTakesMouse(inside)
             if !inside { ui.mode = .closed }
         case .drop:
-            // Stays while the pointer is on it, and a moment after; goes back
-            // up on its own otherwise.
+            // Up after 6 s on its own. Hovering holds it; once the pointer
+            // has been on it and left, it goes up a second later (it's been
+            // seen), whatever is left of the 6 s.
             let bounds = ui.shapeProbe.screenFrame?.insetBy(dx: -14, dy: -14) ?? hotZone
             let inside = bounds.contains(mouse)
-            panel.ignoresMouseEvents = !inside
+            setTakesMouse(inside)
             let now = Date()
             if inside { dropHoveredAt = now }
-            // Nobody at the Mac (no input for a while, display off, or
-            // locked): keep the card down. Its timer starts once the pointer
-            // moves again, and then it stays longer.
+            // Nobody at the Mac (display off or locked): keep the card down.
+            // Its 8 s start once the pointer moves again.
             if Self.userAway {
                 if !dropWaitedForUser { EventLog.write("drop waiting: user away") }
                 dropWaitedForUser = true
@@ -455,16 +520,17 @@ final class NotchController {
                 if Self.pointerIdleSeconds > 1.5 {
                     dropShownAt = now
                 } else {
-                    EventLog.write("drop: user back (pointer moved), showing 15 s more")
+                    EventLog.write("drop: user back (pointer moved), showing 8 s more")
                     dropWaitedForUser = false
-                    dropDuration = 15
+                    dropDuration = 8
                     dropShownAt = now
                 }
             }
             let shownLongEnough = now.timeIntervalSince(dropShownAt) > dropDuration
-            let leftLongEnough = now.timeIntervalSince(dropHoveredAt) > 1.2
-            if shownLongEnough && leftLongEnough {
-                EventLog.write("drop dismissed: timed out")
+            let hovered = dropHoveredAt > dropShownAt
+            let leftFor = now.timeIntervalSince(dropHoveredAt)
+            if !dropWaitedForUser, hovered ? leftFor > 1 : shownLongEnough {
+                EventLog.write("drop dismissed: \(hovered ? "pointer left" : "timed out")")
                 ui.mode = .closed
             }
         case .open:
@@ -489,7 +555,7 @@ final class NotchController {
             let justUsedMenu = menuSeenAt.map { now.timeIntervalSince($0) < 1 } ?? false
             let inside = bounds.contains(mouse) || lingering || menuOpen || justUsedMenu
             let dragging = NSEvent.pressedMouseButtons != 0
-            panel.ignoresMouseEvents = !inside && !dragging
+            setTakesMouse(inside || dragging)
             let held = pin == .hotKey || (pin == .approval && !store.approvals.isEmpty)
             if inside {
                 pin = .none
@@ -505,9 +571,11 @@ final class NotchController {
         }
     }
 
-    /// The reply or Ask field has the cursor (clicking a button doesn't count).
+    /// Something is typed in the reply or Ask field. An empty field with
+    /// the cursor in it doesn't hold the notch open.
     private var isEditingText: Bool {
-        panel.isKeyWindow && panel.firstResponder is NSTextView
+        guard panel.isKeyWindow, let editor = panel.firstResponder as? NSTextView else { return false }
+        return !editor.string.isEmpty
     }
 }
 
@@ -523,25 +591,42 @@ final class NotchPanel: NSPanel {
     }
 }
 
-/// ⌥Space, system-wide, through Carbon's hot key API (no Accessibility
-/// permission needed). If another app already owns the shortcut,
-/// registration fails quietly and the notch still opens by pointer.
+/// The Ask shortcut (⌥ Space unless changed in Settings), system-wide,
+/// through Carbon's hot key API (no Accessibility permission needed). It
+/// re-registers when the shortcut changes. If another app already owns the
+/// combination, registration fails, which is logged, and the notch still
+/// opens by pointer.
 final class HotKey {
     private var reference: EventHotKeyRef?
+    private var observer: Any?
     private nonisolated(unsafe) static var action: (() -> Void)?
+    /// Set while Settings records a new shortcut, so pressing the old one
+    /// doesn't open the notch.
+    nonisolated(unsafe) static var paused = false
 
     init(action: @escaping () -> Void) {
         HotKey.action = action
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { HotKey.action?() }
+            DispatchQueue.main.async { if !HotKey.paused { HotKey.action?() } }
             return noErr
         }, 1, &spec, nil, nil)
+        register(Shortcut.current)
+        observer = NotificationCenter.default.addObserver(forName: Shortcut.changed, object: nil, queue: .main) { [weak self] _ in
+            self?.register(Shortcut.current)
+        }
+    }
+
+    private func register(_ shortcut: Shortcut) {
+        if let reference { UnregisterEventHotKey(reference) }
+        reference = nil
         let id = EventHotKeyID(signature: OSType(0x4E54_4348), id: 1) // "NTCH"
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), id, GetApplicationEventTarget(), 0, &reference)
+        let status = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, id, GetApplicationEventTarget(), 0, &reference)
+        if status != noErr { EventLog.write("shortcut \(shortcut.display) is taken by another app (\(status))") }
     }
 
     deinit {
         if let reference { UnregisterEventHotKey(reference) }
+        if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 }

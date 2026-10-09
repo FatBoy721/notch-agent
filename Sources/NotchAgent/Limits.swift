@@ -16,6 +16,10 @@ struct PlanLimits {
     var week: Window?
     var weekOpus: Window?
     var weekSonnet: Window?
+    /// The shorter window's length, for its label ("Session · 5h").
+    var sessionLabel = "Session · 5h"
+    /// The plan as the service names it ("Plus", "Pro"), when it says.
+    var planName: String?
     /// Usage credits ("extra usage") switched on for the account.
     var creditsEnabled: Bool?
     var checkedAt = Date()
@@ -105,6 +109,10 @@ final class LimitsStore: ObservableObject {
     @Published private(set) var limits: PlanLimits?
     /// Codex's own limits, as its latest session log recorded them.
     @Published private(set) var codex: PlanLimits?
+    /// Kimi Code's, when it's signed in on this Mac.
+    @Published private(set) var kimi: PlanLimits?
+    @Published private(set) var kimiProblem: String?
+    var hasKimi: Bool { KimiLimits.isInstalled }
     @Published private(set) var problem: String?
     @Published private(set) var plan: ClaudePlan?
     @Published private(set) var fable: FableAccess = .unknown
@@ -123,6 +131,14 @@ final class LimitsStore: ObservableObject {
             defer { loading = false }
             codex = await Task.detached(priority: .utility) { CodexLimits.latest() }.value
             plan = await Task.detached(priority: .utility) { ClaudeAccount.plan() }.value
+            if KimiLimits.isInstalled {
+                do {
+                    kimi = try await KimiLimits.fetch()
+                    kimiProblem = nil
+                } catch {
+                    if kimi == nil { kimiProblem = error.localizedDescription }
+                }
+            }
             do {
                 limits = try await ClaudeAccount.fetchLimits()
                 problem = nil
@@ -159,7 +175,12 @@ enum CodexLimits {
                     let resets = (entry["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
                     return PlanLimits.Window(utilization: used.doubleValue, resetsAt: resets)
                 }
-                return PlanLimits(session: window("primary"), week: window("secondary"), checkedAt: modified)
+                // Codex logs a second pool ("premium") with no windows in
+                // between the real ones; it says nothing, so look further back.
+                let session = window("primary"), week = window("secondary")
+                guard session != nil || week != nil else { continue }
+                return PlanLimits(session: session, week: week,
+                                  planName: (limits["plan_type"] as? String)?.capitalized, checkedAt: modified)
             }
         }
         return nil
@@ -173,6 +194,73 @@ enum CodexLimits {
             for child in array { if let found = find(key, in: child) { return found } }
         }
         return nil
+    }
+}
+
+/// Kimi Code's plan use, the numbers its `/usage` shows: GET
+/// api.kimi.com/coding/v1/usages with the sign-in Kimi Code keeps in
+/// ~/.kimi-code/credentials. Like Claude's, the token is only sent to Kimi
+/// and never refreshed here; Kimi Code refreshes it while it runs.
+enum KimiLimits {
+    enum Failure: LocalizedError {
+        case signedOut, http(Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .signedOut: "Kimi Code's sign-in has expired. Run `kimi` once (or /login in it) to refresh it."
+            case .http(let status): "Kimi's usage service answered \(status)."
+            }
+        }
+    }
+
+    private static let credentials = NSHomeDirectory() + "/.kimi-code/credentials/kimi-code.json"
+
+    static var isInstalled: Bool { FileManager.default.fileExists(atPath: credentials) }
+
+    static func fetch() async throws -> PlanLimits {
+        guard let data = FileManager.default.contents(atPath: credentials),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = json["access_token"] as? String, !token.isEmpty else { throw Failure.signedOut }
+        var request = URLRequest(url: URL(string: "https://api.kimi.com/coding/v1/usages")!, timeoutInterval: 10)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (body, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw status == 401 ? Failure.signedOut : Failure.http(status) }
+        return parse((try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:])
+    }
+
+    /// `usage` is the plan's main (weekly) allowance; `limits` the shorter
+    /// rate windows, each with its length.
+    static func parse(_ payload: [String: Any]) -> PlanLimits {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        func window(_ raw: Any?) -> PlanLimits.Window? {
+            guard let raw = raw as? [String: Any] else { return nil }
+            let used = number(raw["used"]), limit = number(raw["limit"])
+            guard let limit, limit > 0 else { return nil }
+            let resets = (raw["resetTime"] as? String).flatMap { parser.date(from: $0) ?? ISO8601DateFormatter().date(from: $0) }
+            return PlanLimits.Window(utilization: min(100, 100 * (used ?? 0) / limit), resetsAt: resets)
+        }
+        var limits = PlanLimits(week: window(payload["usage"]))
+        if let first = (payload["limits"] as? [[String: Any]])?.first, let session = window(first["detail"]) {
+            limits.session = session
+            limits.sessionLabel = "Session · " + length(first["window"])
+        }
+        return limits
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        return (value as? String).flatMap(Double.init)
+    }
+
+    /// {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"} → "5h".
+    private static func length(_ raw: Any?) -> String {
+        guard let raw = raw as? [String: Any], var duration = number(raw["duration"]).map(Int.init) else { return "limit" }
+        var unit = ["TIME_UNIT_MINUTE": "m", "TIME_UNIT_HOUR": "h", "TIME_UNIT_DAY": "d", "TIME_UNIT_WEEK": "w"][raw["timeUnit"] as? String ?? ""] ?? ""
+        if unit == "m", duration >= 60, duration % 60 == 0 { duration /= 60; unit = "h" }
+        return "\(duration)\(unit)"
     }
 }
 
@@ -245,54 +333,110 @@ enum ClaudeAccount {
     }
 }
 
-/// The Claude plan card, and the Codex one beside it when Codex has run.
+/// A card per plan: Claude's, then Codex's once it has run and Kimi
+/// Code's when it's signed in. Two fit side by side; with more, the row
+/// slides on a page every few seconds (not while the pointer is on it), and
+/// dots show where it is.
 struct LimitsCards: View {
     @ObservedObject var limits: LimitsStore
     @ObservedObject var usage: UsageStore
+    @State private var shown: Int? = 0
+    @State private var hovering = false
+
+    private struct Plan: Identifiable {
+        let kind: AgentKind
+        /// Tapping shows its token use below; Kimi keeps no logs to count.
+        let provider: UsageProvider?
+        let limits: PlanLimits?
+        let problem: String?
+        let name: String?
+        var id: String { kind.id }
+    }
+
+    private var plans: [Plan] {
+        var plans = [Plan(kind: .claude, provider: .claude, limits: limits.limits, problem: limits.problem, name: limits.plan?.name)]
+        if let codex = limits.codex {
+            plans.append(Plan(kind: .codex, provider: .codex, limits: codex, problem: nil, name: codex.planName))
+        }
+        if limits.hasKimi {
+            plans.append(Plan(kind: AgentKind(id: "kimi"), provider: nil, limits: limits.kimi, problem: limits.kimiProblem, name: "Code"))
+        }
+        return plans
+    }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            card(.claude, provider: .claude) {
-                LimitsCard(kind: .claude, plan: limits.limits, problem: limits.problem, planName: limits.plan?.name)
-            }
-            if let codex = limits.codex {
-                card(.codex, provider: .codex) { LimitsCard(kind: .codex, plan: codex, problem: nil) }
+        let plans = plans
+        Group {
+            if plans.count <= 2 {
+                HStack(alignment: .top, spacing: 10) {
+                    ForEach(plans) { card($0) }
+                }
+            } else {
+                carousel(plans)
             }
         }
         .onAppear { limits.refresh() }
+    }
+
+    private func carousel(_ plans: [Plan]) -> some View {
+        // Pages of two, so each plan shows once; an odd one out sits beside
+        // an empty slot at the same width.
+        let pages = stride(from: 0, to: plans.count, by: 2).map { Array(plans[$0..<min($0 + 2, plans.count)]) }
+        return VStack(spacing: 7) {
+            ScrollView(.horizontal) {
+                LazyHStack(alignment: .top, spacing: 10) {
+                    ForEach(Array(pages.enumerated()), id: \.offset) { index, page in
+                        HStack(alignment: .top, spacing: 10) {
+                            ForEach(page) { card($0).frame(maxWidth: .infinity) }
+                            if page.count == 1 { Color.clear.frame(maxWidth: .infinity, maxHeight: 1) }
+                        }
+                        .containerRelativeFrame(.horizontal)
+                        .id(index)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollIndicators(.never)
+            .scrollTargetBehavior(.viewAligned)
+            .scrollPosition(id: $shown, anchor: .leading)
+            .onHover { hovering = $0 }
+            .task(id: pages.count) {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(5))
+                    guard !hovering, !Task.isCancelled else { continue }
+                    withAnimation(.easeInOut(duration: 0.9)) { shown = ((shown ?? 0) + 1) % pages.count }
+                }
+            }
+            HStack(spacing: 5) {
+                ForEach(pages.indices, id: \.self) { index in
+                    Capsule()
+                        .fill(.white.opacity(index == (shown ?? 0) ? 0.7 : 0.2))
+                        .frame(width: index == (shown ?? 0) ? 14 : 5, height: 5)
+                        .onTapGesture { withAnimation(.easeInOut(duration: 0.6)) { shown = index } }
+                }
+            }
+            .animation(Motion.calm, value: shown)
+        }
     }
 
     /// Tapping a card shows that agent's usage below it.
-    private func card<Content: View>(_ kind: AgentKind, provider: UsageProvider, @ViewBuilder content: () -> Content) -> some View {
-        let selected = usage.provider == provider
-        return Button {
-            withAnimation(Motion.calm) { usage.provider = provider }
-        } label: {
-            content()
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(kind.color.opacity(selected ? 0.75 : 0), lineWidth: 1.5))
-                .contentShape(RoundedRectangle(cornerRadius: 14))
+    @ViewBuilder
+    private func card(_ plan: Plan) -> some View {
+        let content = LimitsCard(kind: plan.kind, plan: plan.limits, problem: plan.problem, planName: plan.name)
+        if let provider = plan.provider {
+            let selected = usage.provider == provider
+            Button {
+                withAnimation(Motion.calm) { usage.provider = provider }
+            } label: {
+                content
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(plan.kind.color.opacity(selected ? 0.75 : 0), lineWidth: 1.5))
+                    .contentShape(RoundedRectangle(cornerRadius: 14))
+            }
+            .buttonStyle(.plain)
+            .help("Show \(plan.kind.name) usage")
+        } else {
+            content
         }
-        .buttonStyle(.plain)
-        .help("Show \(kind.name) usage")
-    }
-}
-
-/// A small ring of the 5-hour session used, for page headers.
-struct PlanRing: View {
-    @ObservedObject var limits: LimitsStore
-
-    var body: some View {
-        let used = (limits.limits?.session?.utilization ?? 0) / 100
-        ZStack {
-            Circle().stroke(.white.opacity(0.15), lineWidth: 2.5)
-            Circle()
-                .trim(from: 0, to: max(0.02, min(1, used)))
-                .stroke(used < 0.5 ? Palette.ok : used < 0.8 ? Palette.warn : .red, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: 15, height: 15)
-        .help(limits.limits?.session.map { "Claude session: \(Int($0.utilization))% used" } ?? "Plan usage")
-        .onAppear { limits.refresh() }
     }
 }
 
@@ -317,12 +461,12 @@ struct LimitsCard: View {
                 }
             }
             if let plan {
-                if let session = plan.session { LimitRow(label: "Session · 5h", window: session) }
+                if let session = plan.session { LimitRow(label: plan.sessionLabel, window: session) }
                 if let week = plan.week { LimitRow(label: "This week", window: week) }
                 if let opus = plan.weekOpus { LimitRow(label: "Opus this week", window: opus) }
                 if let sonnet = plan.weekSonnet { LimitRow(label: "Sonnet this week", window: sonnet) }
             } else if let problem {
-                Text(problem).font(.system(size: 11.5)).foregroundStyle(Palette.mute).fixedSize(horizontal: false, vertical: true)
+                Text(LocalizedStringKey(problem)).font(.system(size: 11.5)).foregroundStyle(Palette.mute).fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("Checking…").font(.system(size: 11.5)).foregroundStyle(Palette.mute)
             }
@@ -338,8 +482,13 @@ private struct LimitRow: View {
     let label: String
     let window: PlanLimits.Window
 
+    /// A window whose reset time has passed has reset, whatever the last
+    /// reading said (Codex's numbers only update when Codex runs).
+    private var hasReset: Bool { window.resetsAt.map { $0 < Date() } ?? false }
+    private var used: Double { hasReset ? 0 : window.utilization }
+
     private var color: Color {
-        window.utilization < 50 ? Palette.ok : window.utilization < 80 ? Palette.warn : .red
+        used < 50 ? Palette.ok : used < 80 ? Palette.warn : .red
     }
 
     var body: some View {
@@ -347,18 +496,21 @@ private struct LimitRow: View {
             HStack {
                 Text(label).font(.system(size: 12.5, weight: .medium))
                 Spacer()
-                Text("\(Int(window.utilization.rounded()))% used")
+                Text("\(Int(used.rounded()))% used")
                     .font(.system(size: 12.5, weight: .semibold))
                     .monospacedDigit()
             }
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.white.opacity(0.08))
-                    Capsule().fill(color).frame(width: max(4, proxy.size.width * min(1, window.utilization / 100)))
+                    Capsule().fill(color).frame(width: max(4, proxy.size.width * min(1, used / 100)))
                 }
             }
             .frame(height: 5)
-            if let resets = window.resetsAt {
+            if hasReset {
+                Text("reset since last check")
+                    .font(.system(size: 11)).foregroundStyle(Palette.mute)
+            } else if let resets = window.resetsAt {
                 Text("resets in " + Self.remaining(until: resets))
                     .font(.system(size: 11)).foregroundStyle(Palette.mute)
             }

@@ -286,6 +286,11 @@ struct UsageReport {
     }
 
     /// Usage over the last `days` days, today included.
+    /// Tokens per day (yyyy-MM-dd), all models and projects together.
+    var dailyTokens: [String: Int] {
+        buckets.reduce(into: [:]) { days, entry in days[entry.key.day, default: 0] += entry.value.tokens }
+    }
+
     func total(days: Int) -> TokenTotals {
         let start = Calendar.current.date(byAdding: .day, value: -(days - 1), to: Date()) ?? Date()
         let cutoff = Self.dayKey(start)
@@ -392,6 +397,9 @@ struct UsageView: View {
                 StatTile(title: "Today", totals: report.total(days: 1), tokensOnly: isCodex)
                 StatTile(title: "7 days", totals: report.total(days: 7), tokensOnly: isCodex)
                 StatTile(title: "30 days", totals: report.total(days: 30), tokensOnly: isCodex)
+            }
+            if loaded {
+                ActivityHeatmap(daily: report.dailyTokens, color: isCodex ? Palette.codex : Palette.claude)
             }
             HStack {
                 Picker("Group by", selection: $grouping) {
@@ -508,5 +516,84 @@ enum UsageFormat {
     static func breakdown(_ totals: TokenTotals) -> String {
         "Input \(tokens(totals.input)) · Output \(tokens(totals.output)) · "
             + "Cache write \(tokens(totals.cacheWrite)) · Cache read \(tokens(totals.cacheRead))"
+    }
+}
+
+/// GlassCode's activity grid: one square per day, a column per week
+/// (oldest left), brighter for more tokens, plus streaks. Covers what the
+/// logs still hold (Claude Code keeps about a month by default), up to a year.
+private struct ActivityHeatmap: View {
+    let daily: [String: Int]
+    let color: Color
+    private static let weeks = 52
+    private static let cell: CGFloat = 7.5
+    private static let gap: CGFloat = 2
+
+    var body: some View {
+        let days = Self.days()
+        let top = max(1, daily.values.max() ?? 1)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                Text("Activity").font(.system(size: 11.5, weight: .semibold))
+                Spacer()
+                let (current, longest) = streaks(days)
+                Label("\(current) day\(current == 1 ? "" : "s")", systemImage: "flame.fill")
+                    .foregroundStyle(current > 0 ? color : Palette.mute)
+                    .help("Current streak: days in a row with any usage")
+                Text("Longest \(longest)").foregroundStyle(Palette.mute)
+            }
+            .font(.system(size: 11, weight: .medium))
+            HStack(alignment: .top, spacing: Self.gap) {
+                ForEach(0..<Self.weeks, id: \.self) { week in
+                    VStack(spacing: Self.gap) {
+                        ForEach(0..<7, id: \.self) { weekday in
+                            let day = days[week * 7 + weekday]
+                            RoundedRectangle(cornerRadius: 1.8)
+                                .fill(fill(day.map { daily[$0] ?? 0 }, top: top))
+                                .frame(width: Self.cell, height: Self.cell)
+                                .help(day.map { "\($0): \(UsageFormat.tokens(daily[$0] ?? 0)) tokens" } ?? "")
+                        }
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// 52 × 7 day keys, Sunday-first columns ending with this week; days
+    /// after today are nil.
+    private static func days() -> [String?] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let weekday = calendar.component(.weekday, from: today) - 1   // 0 = Sunday
+        let start = calendar.date(byAdding: .day, value: -(weeks * 7 - 1 - (6 - weekday)), to: today) ?? today
+        return (0..<(weeks * 7)).map { offset in
+            guard let date = calendar.date(byAdding: .day, value: offset, to: start), date <= today else { return nil }
+            return UsageReport.dayKey(date)
+        }
+    }
+
+    /// Log scale, so one huge day doesn't flatten the rest.
+    private func fill(_ tokens: Int?, top: Int) -> Color {
+        guard let tokens else { return .clear }
+        guard tokens > 0 else { return .white.opacity(0.06) }
+        let level = log(Double(tokens) + 1) / log(Double(top) + 1)
+        return color.opacity(0.25 + 0.75 * level)
+    }
+
+    private func streaks(_ days: [String?]) -> (current: Int, longest: Int) {
+        var longest = 0, run = 0
+        for day in days.compactMap({ $0 }) {
+            run = (daily[day] ?? 0) > 0 ? run + 1 : 0
+            longest = max(longest, run)
+        }
+        // A day without usage yet today doesn't break the streak.
+        let past = days.compactMap { $0 }
+        var current = 0
+        for (index, day) in past.reversed().enumerated() {
+            if (daily[day] ?? 0) > 0 { current += 1 } else if index > 0 { break }
+        }
+        return (current, longest)
     }
 }

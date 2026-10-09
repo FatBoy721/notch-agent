@@ -5,9 +5,10 @@ struct NotchView: View {
     @ObservedObject var ui: NotchUI
     let services: Services
     @ObservedObject var music: MusicStore
+    /// The tab's width depends on the shortcut's key caps.
+    @AppStorage(Shortcut.defaultsKey) private var shortcutData: Data?
     @State private var pageHeight: CGFloat = 0
     @State private var dropHeight: CGFloat = 0
-    @AppStorage(NotchAppearance.key) private var appearance: NotchAppearance = .glass
     @State private var dropTargeted = false
 
     /// Files dropped on the notch go with the open thread's next reply, or
@@ -43,24 +44,26 @@ struct NotchView: View {
         }
     }
 
-    /// Closed, the notch is solid black like the hardware it extends. Open,
-    /// it's dark Liquid Glass, kept black where it meets the bezel, and
-    /// tinted with the album's color on the Music page.
+    /// Closed, solid black like the hardware it extends. Open, GlassCode's
+    /// frosted glass, kept black where it meets the bezel so it still grows
+    /// out of the notch, and on the Music page faintly tinted with the
+    /// album's color toward the bottom.
     @ViewBuilder private var background: some View {
         let shape = NotchShape(radius: radius, ear: ear)
         if isPanel {
             let bezel = min(0.9, ui.notchSize.height / max(1, shapeSize.height))
             Color.clear
-                .notchGlass(in: shape, tint: .black.opacity(0.58), appearance: appearance)
+                .liquidGlass(shape, tint: 0.45)
                 .overlay(shape.fill(LinearGradient(stops: [
                     .init(color: .black, location: 0),
                     .init(color: .black, location: bezel),
                     .init(color: .black.opacity(0), location: min(1, bezel + 0.22)),
                 ], startPoint: .top, endPoint: .bottom)))
                 .overlay(shape.fill(LinearGradient(
-                    colors: [.clear, ui.page == .music && music.nowPlaying != nil ? music.accent.opacity(0.24) : .clear],
+                    colors: [.clear, ui.page == .music && music.nowPlaying != nil ? music.accent.opacity(0.22) : .clear],
                     startPoint: .top, endPoint: .bottom)))
-                .overlay(RimLight(shape: shape))
+                // The rim starts below the black, where the glass shows.
+                .glassRim(shape, from: bezel)
         } else {
             shape.fill(.black)
         }
@@ -89,7 +92,7 @@ struct NotchView: View {
     }
 
     /// The drawn size, ears excluded.
-    /// The "⌥ Space · Ask an agent" hint: while peeking, and always on a
+    /// The "<shortcut> · Ask an agent" hint: while peeking, and always on a
     /// display without a notch, where an idle tab would otherwise be an
     /// empty black bar.
     private var showsHint: Bool { ui.mode == .peek || !ui.hasNotch }
@@ -174,14 +177,21 @@ struct NotchView: View {
                     .stroke(Palette.accent.opacity(dropTargeted ? 0.9 : 0), lineWidth: 2)
                     .animation(.easeOut(duration: 0.15), value: dropTargeted)
             )
+            .overlay(DonePulse(shape: NotchShape(radius: radius, ear: ear), trigger: store.justFinished))
             .dropDestination(for: URL.self) { urls, _ in
                 accept(urls.filter(\.isFileURL))
             } isTargeted: { dropTargeted = $0 }
 
-            if ui.mode == .peek && music.nowPlaying != nil {
-                TabSwitch(ui: ui, musicShown: showsMusic)
-                    .onGeometryChange(for: CGSize.self) { $0.size } action: { ui.switchSize = $0 }
-                    .transition(.opacity.combined(with: .offset(y: -6)).combined(with: .scale(scale: 0.96, anchor: .top)))
+            if ui.mode == .peek {
+                // Under the peeking notch: the music switch while something
+                // plays, and a glance at the plan limits (GlassCode's usage
+                // peek) without opening anything.
+                VStack(spacing: 6) {
+                    if music.nowPlaying != nil { TabSwitch(ui: ui, musicShown: showsMusic) }
+                    UsagePeek(limits: services.limits)
+                }
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { ui.switchSize = $0 }
+                .transition(.opacity.combined(with: .offset(y: -6)).combined(with: .scale(scale: 0.96, anchor: .top)))
             }
             if ui.isOpen {
                 Dock(store: store, ui: ui)
@@ -196,6 +206,9 @@ struct NotchView: View {
         .animation(Motion.morph, value: ui.mode)
         .animation(Motion.calm, value: pageHeight)
         .animation(Motion.calm, value: store.tabStatus)
+        // The closed tab's lyric and its width move together.
+        .animation(Motion.calm, value: music.lyricLine?.id)
+        .animation(Motion.calm, value: music.nowPlaying?.trackKey)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .foregroundStyle(.white)
         .environment(\.colorScheme, .dark)
@@ -277,7 +290,6 @@ struct TypedReply: View {
 /// shows.
 private struct TabSwitch: View {
     @ObservedObject var ui: NotchUI
-    @AppStorage(NotchAppearance.key) private var appearance: NotchAppearance = .glass
     let musicShown: Bool
 
     var body: some View {
@@ -286,8 +298,8 @@ private struct TabSwitch: View {
             option("music.note", "Music", on: musicShown) { ui.tabSide = .music }
         }
         .padding(3)
-        .notchGlass(in: RoundedRectangle(cornerRadius: 12), tint: .black.opacity(0.55), interactive: true, appearance: appearance)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.1), lineWidth: 1))
+        .liquidGlass(RoundedRectangle(cornerRadius: 12), tint: 0.4, interactive: true)
+        .glassRim(RoundedRectangle(cornerRadius: 12))
         .fixedSize()
     }
 
@@ -318,8 +330,9 @@ private struct TabLayout {
         let (left, right): (CGFloat, CGFloat)
         switch status {
         case .quiet:
-            // ⌥ cap + gap + "Space" cap (text, padding) + a little air.
-            let keys = 20 + 4 + textWidth("Space", size: 11.5) + 14 + 6
+            // The shortcut's key caps (each at least 20 wide), gaps, a little air.
+            let caps = Shortcut.current.symbols.map { max(20, textWidth($0, size: 11.5) + 14) }
+            let keys = caps.reduce(0, +) + CGFloat(caps.count - 1) * 4 + 6
             (left, right) = peeking ? (keys, textWidth("Ask an agent", size: 12.5)) : (0, 0)
         case .running(_, let project, let activity):
             (left, right) = (19 + 6 + min(110, textWidth(project, size: 12.5)), activity.width)
@@ -336,6 +349,8 @@ private struct TabLayout {
 }
 
 private struct TabContent: View {
+    /// Redraws the key caps when the shortcut changes in Settings.
+    @AppStorage(Shortcut.defaultsKey) private var shortcutData: Data?
     let status: TabStatus
     let peeking: Bool
     let notchWidth: CGFloat
@@ -368,8 +383,7 @@ private struct TabContent: View {
         switch status {
         case .quiet where peeking:
             HStack(spacing: 4) {
-                Kbd("⌥")
-                Kbd("Space")
+                ForEach(Shortcut.current.symbols, id: \.self) { Kbd($0) }
             }
         case .running(let kind, let project, _):
             AgentGlyph(kind: kind, busy: true)
@@ -495,7 +509,7 @@ private struct PageHeader<Trailing: View>: View {
     }
 }
 
-/// The plan ring, the usage chart and settings, at the right of page headers.
+/// The usage chart and settings, at the right of page headers.
 struct HeaderIcons: View {
     @ObservedObject var store: Store
     @ObservedObject var ui: NotchUI
@@ -503,8 +517,6 @@ struct HeaderIcons: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Button { ui.page = .usage } label: { PlanRing(limits: limits) }
-                .buttonStyle(.plain)
             if ui.page != .usage {
                 Button { ui.page = .usage } label: {
                     Image(systemName: "chart.bar.fill").font(.system(size: 11.5)).foregroundStyle(Palette.mute)
@@ -517,34 +529,16 @@ struct HeaderIcons: View {
     }
 }
 
+/// The gear: Settings, the one toggle people flip often, and Quit.
 struct SettingsMenu: View {
     @ObservedObject var store: Store
-    @State private var opensAtLogin = LoginItem.isEnabled
-    @AppStorage(NotchAppearance.key) private var appearance: NotchAppearance = .glass
     @AppStorage(Store.dropOnFinishKey) private var dropOnFinish = true
 
     var body: some View {
         Menu {
-            Button(store.hooksInstalled ? "Remove Claude Code hooks" : "Install Claude Code hooks") {
-                store.setHooksInstalled(!store.hooksInstalled)
-            }
+            Button("Settings…") { SettingsWindow.shared.show() }
+            Divider()
             Toggle("Drop down when agents finish", isOn: $dropOnFinish)
-            Divider()
-            Picker("Appearance", selection: $appearance) {
-                ForEach(NotchAppearance.allCases, id: \.self) { Text($0.title).tag($0) }
-            }
-            .pickerStyle(.inline)
-            Divider()
-            if LoginItem.isAvailable {
-                Toggle("Open at Login", isOn: Binding(get: { opensAtLogin }, set: { enable in
-                    do {
-                        try LoginItem.set(enable)
-                    } catch {
-                        store.problem = "Couldn't change Open at Login: \(error.localizedDescription)"
-                    }
-                    opensAtLogin = LoginItem.isEnabled
-                }))
-            }
             Divider()
             Button("Quit Notch Agent") { NSApp.terminate(nil) }
         } label: {
@@ -565,7 +559,8 @@ private struct ThreadsPage: View {
     let limits: LimitsStore
 
     var body: some View {
-        let sessions = store.orderedSessions
+        let sessions = store.listedSessions
+        let old = groups(sessions).filter { $0.title == "Earlier" || $0.title == "Waiting a while" }.flatMap(\.sessions)
         VStack(alignment: .leading, spacing: 10) {
             PageHeader(title: "Threads", count: sessions.isEmpty ? nil : sessions.count) {
                 if usage.loaded {
@@ -574,18 +569,42 @@ private struct ThreadsPage: View {
                         .foregroundStyle(Palette.mute)
                         .help("API-equivalent spend today")
                 }
+                if !old.isEmpty || store.hiddenCount > 0 {
+                    Menu {
+                        if !old.isEmpty {
+                            Button("Hide \(old.count) old thread\(old.count == 1 ? "" : "s")") {
+                                withAnimation { store.hide(old.map(\.id)) }
+                            }
+                        }
+                        if store.hiddenCount > 0 {
+                            Button("Show \(store.hiddenCount) hidden") { withAnimation { store.showHidden() } }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle").font(.system(size: 12.5)).foregroundStyle(Palette.mute)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Clean up the list")
+                }
                 HeaderIcons(store: store, ui: ui, limits: limits)
             }
             if sessions.isEmpty {
                 EmptyState(store: store)
             } else {
-                CappedScroll(maxHeight: 300) {
-                    VStack(spacing: 6) {
-                        ForEach(sessions) { session in
-                            ThreadRow(session: session, needsYou: store.approvals.contains { $0.sessionID == session.id }) {
-                                ui.page = .thread(session.id)
+                CappedScroll(maxHeight: 440, fadesOverflow: true) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(groups(sessions), id: \.title) { group in
+                            VStack(alignment: .leading, spacing: 2) {
+                                ThreadGroupLabel(title: group.title)
+                                ForEach(group.sessions) { session in
+                                    ThreadRow(store: store, ui: ui, session: session,
+                                              needsYou: store.approvals.contains { $0.sessionID == session.id }) {
+                                        ui.page = .thread(session.id)
+                                    }
+                                    .transition(.asymmetric(insertion: Motion.row, removal: Motion.dust))
+                                }
                             }
-                            .transition(Motion.row)
                         }
                     }
                 }
@@ -593,39 +612,337 @@ private struct ThreadsPage: View {
         }
         .onAppear { usage.refresh() }
     }
+
+    /// Hermes' sidebar grouping: what needs attention now, then by age,
+    /// with long-unanswered waits last. Empty groups are left out.
+    private func groups(_ sessions: [AgentSession]) -> [(title: String, sessions: [AgentSession])] {
+        let dayAgo = Date().addingTimeInterval(-86_400)
+        var now: [AgentSession] = [], today: [AgentSession] = [], earlier: [AgentSession] = [], stale: [AgentSession] = []
+        for session in sessions {
+            let needsYou = store.approvals.contains { $0.sessionID == session.id }
+            if session.status == .working || needsYou || (session.status == .waiting && !session.isStaleWait) {
+                now.append(session)
+            } else if session.isStaleWait {
+                stale.append(session)
+            } else if (session.finishedAt ?? session.updatedAt) > dayAgo {
+                today.append(session)
+            } else {
+                earlier.append(session)
+            }
+        }
+        return [("Now", now), ("Today", today), ("Earlier", earlier), ("Waiting a while", stale)].filter { !$0.1.isEmpty }
+    }
+}
+
+/// A subagent's identity, as in GlassCode: a scientist's name and a color,
+/// picked from its tool call id so it stays the same while it runs.
+enum Subagent {
+    private static let names = ["Lovelace", "Turing", "Curie", "Hopper", "Noether", "Feynman", "Dirac", "Heisenberg",
+                                "Ramanujan", "Tesla", "Meitner", "Shannon", "Hamilton", "Franklin", "Euler", "Darwin"]
+    private static let colors: [Color] = [
+        Color(red: 0.98, green: 0.55, blue: 0.4), Color(red: 0.45, green: 0.7, blue: 1), Color(red: 0.55, green: 0.85, blue: 0.5),
+        Color(red: 0.85, green: 0.6, blue: 1), Color(red: 1, green: 0.8, blue: 0.35), Color(red: 0.4, green: 0.85, blue: 0.85),
+    ]
+
+    /// Stable across runs (unlike `hashValue`).
+    private static func seed(_ item: FeedItem) -> Int {
+        (item.toolUseID ?? item.id.uuidString).unicodeScalars.reduce(5381) { ($0 &* 33 &+ Int($1.value)) & 0x7fff_ffff }
+    }
+
+    static func name(_ item: FeedItem) -> String { names[seed(item) % names.count] }
+    /// Follows the name, so different names mostly get different colors.
+    static func color(_ item: FeedItem) -> Color { colors[seed(item) % names.count % colors.count] }
+}
+
+/// The turn's subagents: who, what they're on, running or done.
+private struct SubagentList: View {
+    let subagents: [FeedItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Subagents · \(subagents.filter { !$0.isDone }.count) running")
+                .font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.mute)
+            ForEach(subagents) { item in
+                HStack(spacing: 8) {
+                    if item.isDone {
+                        Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(Palette.ok).frame(width: 10)
+                    } else {
+                        ArcSpinner(size: 10, color: Subagent.color(item))
+                    }
+                    Text(Subagent.name(item)).font(.system(size: 12, weight: .bold)).foregroundStyle(Subagent.color(item))
+                    Text(item.title).font(.system(size: 12)).foregroundStyle(.white.opacity(item.isDone ? 0.45 : 0.8)).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+}
+
+/// How full Claude's context window is, as a ring that turns amber, then
+/// red, as Claude Code nears compacting the conversation.
+struct ContextRing: View {
+    let fraction: Double
+    let limit: Int
+    /// Rows show the % only once it's worth reading; the thread header
+    /// always does, so a nearly empty ring isn't mistaken for a spinner.
+    var showsPercent = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ZStack {
+                Circle().stroke(.white.opacity(0.14), lineWidth: 2)
+                Circle()
+                    .trim(from: 0, to: max(0.03, fraction))
+                    .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+            }
+            .frame(width: 12, height: 12)
+            if showsPercent || fraction >= 0.6 {
+                Text("\(Int(fraction * 100))%")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .monospacedDigit()
+                    .foregroundStyle(color)
+            }
+        }
+        .help("Context \(Int(fraction * 100))% of \(limit >= 1_000_000 ? "1M" : "\(limit / 1000)k") tokens. The agent compacts the conversation near the limit.")
+    }
+
+    private var color: Color {
+        fraction < 0.6 ? .white.opacity(0.45) : fraction < 0.8 ? Palette.warn : .red
+    }
+}
+
+/// A green ring that flashes out from the notch when an agent finishes.
+private struct DonePulse<S: Shape>: View {
+    let shape: S
+    let trigger: String?
+    @State private var progress: CGFloat = 1
+
+    var body: some View {
+        shape
+            .stroke(Palette.ok.opacity(0.85 * (1 - progress)), lineWidth: 2 + 3 * progress)
+            .scaleEffect(1 + 0.05 * progress, anchor: .top)
+            .allowsHitTesting(false)
+            .onChange(of: trigger) { _, finished in
+                guard finished != nil else { return }
+                progress = 0
+                withAnimation(.easeOut(duration: 1.1)) { progress = 1 }
+            }
+    }
+}
+
+/// The plan's 5-hour and weekly use, shown under the notch while the
+/// pointer rests on it.
+private struct UsagePeek: View {
+    @ObservedObject var limits: LimitsStore
+
+    var body: some View {
+        Group {
+            if let plan = limits.limits, plan.session != nil || plan.week != nil {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let session = plan.session { row("5-hour", session) }
+                    if let week = plan.week { row("Week", week) }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(width: 270)
+                .liquidGlass(RoundedRectangle(cornerRadius: 12), tint: 0.4)
+                .glassRim(RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .onAppear { limits.refresh() }
+    }
+
+    private func row(_ label: String, _ window: PlanLimits.Window) -> some View {
+        let used = min(1, window.utilization / 100)
+        return HStack(spacing: 8) {
+            Text(label).foregroundStyle(Palette.mute).frame(width: 44, alignment: .leading)
+            ZStack(alignment: .leading) {
+                Capsule().fill(.white.opacity(0.12))
+                Capsule().fill(used < 0.5 ? Palette.ok : used < 0.8 ? Palette.warn : .red)
+                    .frame(width: max(3, 96 * used))
+            }
+            .frame(width: 96, height: 4)
+            Text("\(Int(window.utilization))%").monospacedDigit().frame(width: 32, alignment: .trailing)
+            Spacer(minLength: 0)
+            if let resets = window.resetsAt {
+                Text(Self.until(resets)).foregroundStyle(Palette.mute).lineLimit(1).fixedSize()
+            }
+        }
+        .font(.system(size: 11, weight: .semibold))
+    }
+
+    /// "2h 10m", "3d 4h": until the window resets.
+    private static func until(_ date: Date) -> String {
+        let minutes = max(0, Int(date.timeIntervalSinceNow / 60))
+        if minutes < 60 { return "\(minutes)m" }
+        if minutes < 1440 { return "\(minutes / 60)h \(minutes % 60)m" }
+        return "\(minutes / 1440)d \(minutes % 1440 / 60)h"
+    }
+}
+
+/// "■ TODAY": a small square and letter-spaced caps over a group of rows.
+private struct ThreadGroupLabel: View {
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Rectangle().fill(Palette.mute).frame(width: 5, height: 5)
+            Text(title.uppercased()).font(.system(size: 10, weight: .bold)).tracking(1.2).foregroundStyle(Palette.mute)
+        }
+        .padding(.leading, 10)
+        .padding(.bottom, 2)
+    }
+}
+
+/// A thread's actions, in its row's right-click menu and behind ⋯ on its
+/// page: rename it, take its run with you (summary, diff, log), and the
+/// housekeeping (compact, hide, close).
+private struct ThreadMenu: View {
+    let store: Store
+    let ui: NotchUI
+    let session: AgentSession
+    /// Hiding only makes sense from the list.
+    let inList: Bool
+
+    var body: some View {
+        Button("Rename…") { rename() }
+        Divider()
+        Button("Copy run summary") { store.copySummary(session.id) }
+        if session.kind == .claude || session.kind == .codex || !session.changedFiles.isEmpty {
+            Button(session.changedFiles.isEmpty ? "Copy diff of uncommitted changes" : "Copy diff of files it changed") {
+                store.copyDiff(session.id)
+            }
+        }
+        if session.kind == .claude || session.kind == .codex {
+            Button("Show transcript in Finder") { store.revealTranscript(session.id) }
+        }
+        Divider()
+        if session.canCompact { Button("Compact context") { store.compactContext(session.id) } }
+        if inList { Button("Hide from list") { withAnimation { store.hide([session.id]) } } }
+        if session.herdr != nil { Button("Close agent (ends its herdr pane)…") { confirmClose() } }
+    }
+
+    private func rename() {
+        let alert = NSAlert()
+        alert.messageText = "Rename thread"
+        alert.informativeText = "Leave it empty to go back to its latest prompt."
+        let field = NSTextField(string: session.customTitle ?? session.title)
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runAboveNotch(below: notchFrame) == .alertFirstButtonReturn else { return }
+        store.rename(session.id, to: field.stringValue)
+    }
+
+    private func confirmClose() {
+        let alert = NSAlert()
+        alert.messageText = "Close \(session.agent) in \(session.herdrTab ?? session.project)?"
+        alert.informativeText = "This closes its herdr pane and ends the agent. Anything it's doing stops."
+        alert.addButton(withTitle: "Close")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        if alert.runAboveNotch(below: notchFrame) == .alertFirstButtonReturn { withAnimation { store.closeAgent(session.id) } }
+    }
+
+    /// The open notch with its dock, on screen; dialogs open just below it.
+    private var notchFrame: NSRect? {
+        [ui.shapeProbe.screenFrame, ui.dockProbe.screenFrame].compactMap { $0 }.reduce(nil) { $0?.union($1) ?? $1 }
+    }
+}
+
+extension NSAlert {
+    /// The notch floats above the menu bar, so an alert at its normal level
+    /// opened behind it, out of sight, and blocked the app until dismissed.
+    /// Given the notch's frame, the alert opens centered just below it
+    /// rather than over it, where it would hide what it's about.
+    func runAboveNotch(below notch: NSRect? = nil) -> NSApplication.ModalResponse {
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 4)
+        NSApp.activate()
+        if let notch {
+            layout()
+            let window = window
+            let place = {
+                let size = window.frame.size
+                let visible = (NSScreen.screens.first { $0.frame.intersects(notch) } ?? NSScreen.main)?.visibleFrame ?? .zero
+                let x = min(max(notch.midX - size.width / 2, visible.minX), visible.maxX - size.width)
+                let top = max(notch.minY - 12, visible.minY + size.height)
+                window.setFrameTopLeftPoint(NSPoint(x: x, y: top))
+            }
+            place()
+            // runModal centers the window as it opens; move it back once shown.
+            DispatchQueue.main.async(execute: place)
+        }
+        return runModal()
+    }
 }
 
 private struct ThreadRow: View {
+    let store: Store
+    let ui: NotchUI
     let session: AgentSession
     let needsYou: Bool
     let open: () -> Void
     @State private var hovering = false
 
+    /// Near the end of its window: offer to compact right in the row.
+    private var nearlyFull: Bool { (session.contextFraction ?? 0) >= 0.75 && session.canCompact }
+
     var body: some View {
-        Button(action: open) {
-            HStack(spacing: 12) {
-                AgentGlyph(kind: session.kind, busy: session.status == .working, size: 17)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(session.title).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
-                    Text(subtitle).font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.46)).lineLimit(1)
-                }
-                Spacer(minLength: 8)
-                ThreadStatus(session: session, needsYou: needsYou)
-                Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold)).foregroundStyle(.white.opacity(0.3))
+        // The Compact pill sits beside the row's button, not inside it, so
+        // each takes its own clicks.
+        HStack(spacing: 6) {
+            rowButton
+            if nearlyFull {
+                Button("Compact") { store.compactContext(session.id) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10.5, weight: .bold))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(.white.opacity(0.12), in: Capsule())
+                    .help("Ask \(session.agent) to compact its context now")
             }
-            .padding(.horizontal, 14)
-            .frame(minHeight: 54)
-            .background(.white.opacity(hovering ? 0.1 : 0.06), in: RoundedRectangle(cornerRadius: 14))
-            .contentShape(RoundedRectangle(cornerRadius: 14))
         }
-        .buttonStyle(.plain)
+        .padding(.trailing, nearlyFull ? 6 : 0)
+        .background(.white.opacity(hovering ? 0.07 : 0), in: RoundedRectangle(cornerRadius: 8))
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.15), value: hovering)
+        .contextMenu { ThreadMenu(store: store, ui: ui, session: session, inList: true) }
+    }
+
+    private var rowButton: some View {
+        Button(action: open) {
+            // Slim, like Hermes' sidebar: no card per row, a highlight on hover.
+            HStack(spacing: 10) {
+                AgentGlyph(kind: session.kind, busy: session.status == .working, size: 14)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(session.title).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
+                    Text(subtitle).font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.42)).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                let running = session.subagents.filter { !$0.isDone }
+                if !running.isEmpty {
+                    HStack(spacing: 3) {
+                        ForEach(running.prefix(5)) { Circle().fill(Subagent.color($0)).frame(width: 6, height: 6) }
+                    }
+                    .help("\(running.count) subagent\(running.count == 1 ? "" : "s") running")
+                }
+                if let fraction = session.contextFraction {
+                    ContextRing(fraction: fraction, limit: session.contextLimit)
+                }
+                ThreadStatus(session: session, needsYou: needsYou)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
     }
 
     private var subtitle: String {
         if let tool = session.lastTool { return "\(tool.tool ?? "Tool") \(tool.title)" }
-        return "\(session.project) · \(session.modelName ?? session.agent)"
+        return "\(session.herdrTab ?? session.project) · \(session.modelName ?? session.agent)"
     }
 }
 
@@ -639,12 +956,17 @@ private struct ThreadStatus: View {
                 Text("Needs you").fontWeight(.bold).foregroundStyle(Palette.warn)
             } else if session.status == .working {
                 HStack(spacing: 8) {
-                    ActivityLabel(activity: session.activity, size: 12)
+                    ActivityLabel(activity: session.activity, size: 12, showsGlyph: false)
                     ActivityGrid(color: session.kind.color)
                     if let start = session.turnStartedAt { Elapsed(since: start) }
                 }
             } else if session.status == .waiting {
-                Text("Needs you").fontWeight(.bold).foregroundStyle(Palette.warn)
+                // How long it's waited; long waits fade so fresh ones stand out.
+                HStack(spacing: 4) {
+                    Text("Needs you").fontWeight(.bold)
+                    if let since = session.waitingSince { Waited(since: since) }
+                }
+                .foregroundStyle(Palette.warn.opacity(session.isStaleWait ? 0.5 : 1))
             } else if session.status == .ended {
                 Text("Ended").foregroundStyle(Palette.mute)
             } else if let finished = session.finishedAt {
@@ -656,7 +978,7 @@ private struct ThreadStatus: View {
                 Text("Idle").foregroundStyle(Palette.mute)
             }
         }
-        .font(.system(size: 12, weight: .semibold))
+        .font(.system(size: 11.5, weight: .semibold))
     }
 }
 
@@ -674,14 +996,29 @@ private struct Ago: View {
     }
 }
 
-/// "9.4s", "2m 05s": ticking time since the turn started.
+/// "· 12m", "· 3h", "· 2d": how long a thread has waited on the user.
+private struct Waited: View {
+    let since: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            let minutes = Int(max(0, context.date.timeIntervalSince(since)) / 60)
+            Text("· " + (minutes < 1 ? "now" : minutes < 60 ? "\(minutes)m" : minutes < 1440 ? "\(minutes / 60)h" : "\(minutes / 1440)d"))
+                .fontWeight(.semibold)
+        }
+    }
+}
+
+/// "9s", "2m 05s": ticking time since the turn started. Whole seconds, on
+/// the wall clock's second, so every counter on screen updates in the same
+/// frame (tenths at 10 Hz per row made long thread lists lag).
 struct Elapsed: View {
     let since: Date
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.1)) { context in
-            let seconds = max(0, context.date.timeIntervalSince(since))
-            Text(seconds < 60 ? String(format: "%.1fs", seconds) : String(format: "%dm %02ds", Int(seconds) / 60, Int(seconds) % 60))
+        TimelineView(.periodic(from: Date(timeIntervalSinceReferenceDate: Date().timeIntervalSinceReferenceDate.rounded(.down)), by: 1)) { context in
+            let seconds = Int(max(0, context.date.timeIntervalSince(since)))
+            Text(seconds < 60 ? "\(seconds)s" : String(format: "%dm %02ds", seconds / 60, seconds % 60))
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.85))
         }
@@ -695,6 +1032,15 @@ private struct ThreadPage: View {
     @ObservedObject var ui: NotchUI
     let session: AgentSession
 
+    /// "notch-agent · Opus 5.5 · Metalterm · following", each part once
+    /// (a herdr tab is often named after its folder).
+    private var subtitle: String {
+        let parts = [session.project, session.modelName ?? session.agent]
+            + session.terminalName.components(separatedBy: " · ") + ["following"]
+        var seen = Set<String>()
+        return parts.filter { !$0.isEmpty && seen.insert($0).inserted }.joined(separator: " · ")
+    }
+
     var body: some View {
         let approval = store.approvals.first { $0.sessionID == session.id }
         VStack(alignment: .leading, spacing: 10) {
@@ -706,10 +1052,34 @@ private struct ThreadPage: View {
                 AgentGlyph(kind: session.kind, busy: session.status == .working, size: 19)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(session.title).font(.system(size: 14.5, weight: .bold)).lineLimit(1)
-                    Text([session.project, session.modelName ?? session.agent, session.terminalName, "following"].joined(separator: " · "))
+                    Text(subtitle)
                         .font(.system(size: 11.5, weight: .medium)).foregroundStyle(Palette.mute)
                 }
                 Spacer()
+                if let fraction = session.contextFraction {
+                    ContextRing(fraction: fraction, limit: session.contextLimit, showsPercent: true)
+                    if session.canCompact {
+                        Button("Compact") { store.compactContext(session.id) }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .bold))
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(.white.opacity(0.1), in: Capsule())
+                            .help("Ask \(session.agent) to compact its context now")
+                    }
+                }
+                Menu {
+                    ThreadMenu(store: store, ui: ui, session: session, inList: false)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Palette.mute)
+                        .frame(width: 26, height: 26)
+                        .background(Palette.faint, in: Circle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Rename, copy its summary or diff, show its log")
                 if session.herdr != nil || session.terminal != nil {
                     Button {
                         TerminalBridge.focus(session.terminal, herdr: session.herdr)
@@ -741,13 +1111,18 @@ private struct ThreadPage: View {
                 ToolList(tools: session.turnTools, running: session.status == .working, tint: session.kind.color)
             }
 
+            if !session.subagents.isEmpty {
+                SubagentList(subagents: session.subagents)
+                    .transition(Motion.row)
+            }
+
             if session.status != .working, let reply = session.lastReply {
                 TypedReply(text: reply, lines: 8)
                     .transition(Motion.row)
             }
 
             if let approval {
-                ApprovalCard(store: store, approval: approval)
+                PromptCard(store: store, approval: approval)
                     .transition(Motion.row)
             }
 
@@ -849,48 +1224,6 @@ private struct StatusLine: View {
     }
 }
 
-private struct ApprovalCard: View {
-    @ObservedObject var store: Store
-    let approval: Approval
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 6) {
-                Image(systemName: ToolIcon.name(approval.tool)).foregroundStyle(Palette.warn)
-                Text("Allow **\(approval.tool)**?").font(.system(size: 13.5))
-                Spacer()
-                let queued = store.approvals.count - 1
-                if queued > 0 { Text("+\(queued) more").font(.system(size: 11.5)).foregroundStyle(Palette.mute) }
-            }
-            CappedScroll(maxHeight: 130) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(approval.summary).fontWeight(.semibold)
-                    if let detail = approval.detail {
-                        Text(detail).foregroundStyle(.white.opacity(0.72))
-                    }
-                }
-                .font(.system(size: 11.5, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            HStack(spacing: 8) {
-                Button("Answer in terminal") { store.decide(approval, .terminal) }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Palette.mute)
-                Spacer()
-                Button("Deny") { store.decide(approval, .deny) }
-                    .buttonStyle(PillButtonStyle(color: .white.opacity(0.14)))
-                Button("Allow") { store.decide(approval, .allow) }
-                    .buttonStyle(PillButtonStyle(color: .blue))
-            }
-            .font(.system(size: 12.5, weight: .semibold))
-        }
-        .padding(12)
-        .background(Palette.warn.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.warn.opacity(0.28), lineWidth: 1))
-    }
-}
-
 private struct ReplyBar: View {
     @ObservedObject var store: Store
     @ObservedObject var ui: NotchUI
@@ -906,10 +1239,14 @@ private struct ReplyBar: View {
 
     private var placeholder: String {
         if session.status == .ended { return "Session ended" }
+        // Mid-turn, the agent queues what you send until it can read it.
+        if session.status == .working, session.replyRoute != .none { return "Queue a follow-up for \(session.agent)…" }
         switch session.replyRoute {
         case .herdr: return "Reply into its herdr pane"
         case .terminal: return "Reply into its terminal"
         case .clipboard: return "Reply (copied for you to paste into \(session.terminalName))"
+        // A reply runs in Hermes itself; a Telegram chat won't see it there.
+        case .hermes: return session.origin == "Telegram" ? "Reply in Hermes (it won't show in Telegram)" : "Reply to Hermes"
         case .none: return "Send a prompt from the terminal once to enable replies"
         }
     }
@@ -991,7 +1328,7 @@ private struct EmptyState: View {
 private struct Dock: View {
     @ObservedObject var store: Store
     @ObservedObject var ui: NotchUI
-    @AppStorage(NotchAppearance.key) private var appearance: NotchAppearance = .glass
+    @Namespace private var selection
 
     private var isThreads: Bool {
         if case .thread = ui.page { return true }
@@ -1000,16 +1337,17 @@ private struct Dock: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            DockButton(icon: "pencil", label: "Ask", badge: 0, on: ui.page == .ask) { ui.page = .ask }
+            DockButton(icon: "pencil", label: "Ask", badge: 0, on: ui.page == .ask, selection: selection) { ui.page = .ask }
             DockButton(icon: "list.bullet", label: "Threads", badge: store.sessions.filter { $0.status == .working }.count,
-                       on: isThreads) { ui.page = .threads }
-            DockButton(icon: "chart.bar.fill", label: "Usage", badge: 0, on: ui.page == .usage) { ui.page = .usage }
-            DockButton(icon: "gauge.with.dots.needle.33percent", label: "Stats", badge: 0, on: ui.page == .stats) { ui.page = .stats }
-            DockButton(icon: "music.note", label: "Music", badge: 0, on: ui.page == .music) { ui.page = .music }
+                       on: isThreads, selection: selection) { ui.page = .threads }
+            DockButton(icon: "chart.bar.fill", label: "Usage", badge: 0, on: ui.page == .usage, selection: selection) { ui.page = .usage }
+            DockButton(icon: "gauge.with.dots.needle.33percent", label: "Stats", badge: 0, on: ui.page == .stats, selection: selection) { ui.page = .stats }
+            DockButton(icon: "music.note", label: "Music", badge: 0, on: ui.page == .music, selection: selection) { ui.page = .music }
         }
         .padding(3)
-        .notchGlass(in: RoundedRectangle(cornerRadius: 12), tint: .black.opacity(0.5), interactive: true, appearance: appearance)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.1), lineWidth: 1))
+        .animation(Motion.glide, value: ui.page)
+        .liquidGlass(RoundedRectangle(cornerRadius: 12), tint: 0.4, interactive: true)
+        .glassRim(RoundedRectangle(cornerRadius: 12))
         .fixedSize()
     }
 }
@@ -1019,6 +1357,9 @@ private struct DockButton: View {
     let label: String
     let badge: Int
     let on: Bool
+    /// The highlight is one view gliding between buttons (GlassCode's
+    /// sliding selection), not one per button.
+    let selection: Namespace.ID
     let action: () -> Void
     @State private var hovering = false
 
@@ -1039,18 +1380,24 @@ private struct DockButton: View {
             .foregroundStyle(on || hovering ? .white : .white.opacity(0.6))
             .padding(.horizontal, 14)
             .frame(height: 32)
-            .background(.white.opacity(on ? 0.15 : hovering ? 0.07 : 0), in: RoundedRectangle(cornerRadius: 9))
+            .background {
+                if on {
+                    RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.15))
+                        .matchedGeometryEffect(id: "dock-selection", in: selection)
+                } else if hovering {
+                    RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.07))
+                }
+            }
             .contentShape(RoundedRectangle(cornerRadius: 9))
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .animation(.easeOut(duration: 0.15), value: on)
     }
 }
 
 // MARK: - Shared
 
-private struct PillButtonStyle: ButtonStyle {
+struct PillButtonStyle: ButtonStyle {
     let color: Color
 
     func makeBody(configuration: Configuration) -> some View {

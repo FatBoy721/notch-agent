@@ -27,13 +27,20 @@ final class AskModel: ObservableObject {
 
     /// Agent CLIs installed on this Mac, Claude first.
     static let installedAgents: [AgentKind] = {
-        let folders = ["/opt/homebrew/bin", "/usr/local/bin", NSHomeDirectory() + "/.local/bin", NSHomeDirectory() + "/.npm-global/bin",
-                       NSHomeDirectory() + "/.bun/bin", NSHomeDirectory() + "/.cargo/bin"]
         let candidates = ["claude", "codex", "gemini", "cursor", "opencode", "copilot", "amp", "aider", "grok", "kimi", "droid", "cline"]
-        return candidates.map { AgentKind(id: $0) }.filter { kind in
-            folders.contains { FileManager.default.isExecutableFile(atPath: "\($0)/\(executable(for: kind))") }
-        }
+        return candidates.map { AgentKind(id: $0) }.filter { installedPath(of: executable(for: $0)) != nil }
     }()
+
+    /// Where installers put agent CLIs: Homebrew, npm (global or via nvm),
+    /// bun, cargo, pip/uv (~/.local/bin), and the agents' own installers.
+    nonisolated static func installedPath(of executable: String) -> String? {
+        let home = NSHomeDirectory()
+        var folders = ["/opt/homebrew/bin", "/usr/local/bin", home + "/.local/bin", home + "/.npm-global/bin",
+                       home + "/.bun/bin", home + "/.cargo/bin", home + "/.kimi-code/bin", home + "/.claude/local"]
+        let nvm = home + "/.nvm/versions/node"
+        folders += ((try? FileManager.default.contentsOfDirectory(atPath: nvm)) ?? []).map { "\(nvm)/\($0)/bin" }
+        return folders.lazy.map { "\($0)/\(executable)" }.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
 
     nonisolated static func executable(for kind: AgentKind) -> String {
         kind.id == "cursor" ? "cursor-agent" : kind.id
@@ -62,6 +69,15 @@ final class AskModel: ObservableObject {
                 }
             }
             let text = Attachments.compose(typed, with: attachments)
+            // Hermes runs on its own machine: the prompt goes over its socket.
+            if agent == .hermes {
+                guard let thread = await store.askHermes(text) else { return }
+                prompt = ""
+                attachments = []
+                done()
+                ui.page = .thread(thread)
+                return
+            }
             let command = Self.command(agent: agent, model: model, mode: mode, effort: effort, prompt: text)
             let started = await Task.detached { () -> Bool in
                 let inline = Self.takesPromptArgument(agent)
@@ -276,13 +292,19 @@ struct AskPage: View {
                 ForEach(AskModel.installedAgents, id: \.self) { kind in
                     Button(kind.name) { ask.agent = kind }
                 }
-            }
-            ChipMenu(icon: "folder.fill", label: URL(fileURLWithPath: ask.folder).lastPathComponent, tint: Palette.warn) {
-                ForEach(folders, id: \.self) { folder in
-                    Button((folder as NSString).abbreviatingWithTildeInPath) { ask.folder = folder }
+                if store.hermesConnected {
+                    Divider()
+                    Button("Hermes (on your Hermes machine)") { ask.agent = .hermes }
                 }
-                Divider()
-                Button("Choose…") { chooseFolder() }
+            }
+            if ask.agent != .hermes {
+                ChipMenu(icon: "folder.fill", label: URL(fileURLWithPath: ask.folder).lastPathComponent, tint: Palette.warn) {
+                    ForEach(folders, id: \.self) { folder in
+                        Button((folder as NSString).abbreviatingWithTildeInPath) { ask.folder = folder }
+                    }
+                    Divider()
+                    Button("Choose…") { chooseFolder() }
+                }
             }
             if ask.agent == .claude || ask.agent == .codex {
                 option("cpu", ask.model, Choice.models(for: ask.agent), compact: compact, help: "Model") { ask.model = $0 }
@@ -295,11 +317,13 @@ struct AskPage: View {
             }
             Spacer(minLength: 0)
             AttachButtons(screenshot: takeScreenshot) { ask.attachments += ScreenCapture.chooseFiles() }
-            ChipMenu(icon: "rectangle.split.3x1", label: nil) {
-                if Herdr.isRunning { Button("New herdr tab") { ask.target = .herdr } }
-                Button("New Terminal window") { ask.target = .terminal }
+            if ask.agent != .hermes {
+                ChipMenu(icon: "rectangle.split.3x1", label: nil) {
+                    if Herdr.isRunning { Button("New herdr tab") { ask.target = .herdr } }
+                    Button("New Terminal window") { ask.target = .terminal }
+                }
+                .help(ask.target == .herdr ? "Starts in a new herdr tab" : "Starts in a new Terminal window")
             }
-            .help(ask.target == .herdr ? "Starts in a new herdr tab" : "Starts in a new Terminal window")
         }
     }
 

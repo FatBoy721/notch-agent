@@ -4,7 +4,7 @@ enum SessionStatus {
     case working, waiting, idle, ended
 }
 
-struct FeedItem: Identifiable {
+struct FeedItem: Identifiable, Equatable {
     enum Kind { case prompt, tool, notice, finished }
 
     let id = UUID()
@@ -18,14 +18,20 @@ struct FeedItem: Identifiable {
     var failed = false
     /// What the tool produced, briefly: "188 lines", "+14 −3".
     var result: String? = nil
+    /// Files the tool writes (Edit, Write, MultiEdit, apply_patch…).
+    var files: [String] = []
 }
 
-struct AgentSession: Identifiable {
+struct AgentSession: Identifiable, Equatable {
     let id: String
     var kind: AgentKind = .claude
     var cwd: String
     var terminal: TerminalLocation?
     var herdr: HerdrPane?
+    /// The herdr tab's name, e.g. "Helix-IOS(Claude)".
+    var herdrTab: String?
+    /// Where a chat lives when it isn't a folder: "Telegram" for a Hermes chat.
+    var origin: String?
     /// Seen through Claude Code hooks. Sessions known only from herdr take
     /// their status from herdr instead.
     var fromHooks = true
@@ -40,10 +46,41 @@ struct AgentSession: Identifiable {
     var agentSessionID: String?
     /// The model id, e.g. "claude-opus-5-5".
     var model: String?
+    /// Tokens in the agent's context window after its last reply.
+    var contextTokens: Int?
+    /// The window when the agent reports it (Codex logs it).
+    var contextWindow: Int?
+
+    /// Reported, or for Claude from the model: 1M for the Claude 5 family
+    /// and "[1m]" models, 200k otherwise. Agents compact near the end.
+    var contextLimit: Int {
+        if let contextWindow { return contextWindow }
+        guard let model else { return 200_000 }
+        return model.hasSuffix("[1m]") || model.hasPrefix("claude-opus-5") || model.hasPrefix("claude-sonnet-5")
+            ? 1_000_000 : 200_000
+    }
+
+    /// Codex counts its fixed prompt (12k tokens) as neither used nor free,
+    /// so its "% context left" leaves it out of both; matching that keeps
+    /// the ring and Codex's status line in step.
+    var contextFraction: Double? {
+        let baseline = kind == .codex ? 12_000 : 0
+        return contextTokens.map { min(1, Double(max(0, $0 - baseline)) / Double(max(1, contextLimit - baseline))) }
+    }
+
+    /// Agents with a compact command the notch can send: Claude Code and
+    /// Codex take `/compact`, Hermes its `session.compress`.
+    var canCompact: Bool {
+        [AgentKind.claude, .codex, .hermes].contains(kind) && replyRoute != .none && status != .ended
+    }
     var lastHookAt = Date()
     /// Consecutive terminal readings that disagree with `status`.
     var disagreements = 0
-    var status: SessionStatus = .idle
+    var status: SessionStatus = .idle {
+        didSet { if status != oldValue { waitingSince = status == .waiting ? Date() : nil } }
+    }
+    /// When it started waiting on the user; nil unless waiting.
+    var waitingSince: Date?
     var feed: [FeedItem] = []
     var updatedAt = Date()
     /// The latest prompt, which names the thread.
@@ -52,13 +89,31 @@ struct AgentSession: Identifiable {
     var finishedAt: Date?
 
     var project: String {
-        cwd.isEmpty ? "Session" : URL(fileURLWithPath: cwd).lastPathComponent
+        origin ?? (cwd.isEmpty ? "Session" : URL(fileURLWithPath: cwd).lastPathComponent)
     }
 
     var agent: String { kind.name }
 
+    /// Waiting this long without an answer, a thread is probably abandoned:
+    /// it sinks below the idle ones so live requests stay on top.
+    static let staleWait: TimeInterval = 2 * 3600
+
+    /// Also true when how long it waited is unknown (found waiting, no log).
+    var isStaleWait: Bool {
+        status == .waiting && (waitingSince.map { Date().timeIntervalSince($0) > Self.staleWait } ?? true)
+    }
+
+    /// The name the user gave the thread (right-click › Rename).
+    var customTitle: String?
+
     var title: String {
-        prompt ?? terminalTitle ?? (fromHooks ? "New session in \(project)" : "\(agent) in \(project)")
+        customTitle ?? prompt ?? terminalTitle ?? (fromHooks ? "New session in \(project)" : "\(agent) in \(project)")
+    }
+
+    /// Every file the agent wrote this session, first-touched first.
+    var changedFiles: [String] {
+        var seen = Set<String>()
+        return feed.flatMap(\.files).filter { seen.insert($0).inserted }
     }
 
     var activity: Activity {
@@ -72,13 +127,14 @@ struct AgentSession: Identifiable {
         model.map { $0.hasPrefix("claude") ? UsageReport.modelName($0) : CodexModels.displayName($0) }
     }
 
-    enum ReplyRoute { case herdr, terminal, clipboard, none }
+    enum ReplyRoute { case herdr, terminal, clipboard, hermes, none }
 
     /// How a reply reaches the agent: typed by herdr or Terminal/iTerm2, or
     /// for terminals that can't be scripted (Metalterm, Ghostty…), copied
     /// for the user to paste.
     var replyRoute: ReplyRoute {
         if status == .ended { return .none }
+        if kind == .hermes { return .hermes }
         if herdr != nil { return .herdr }
         guard let terminal else { return .none }
         return terminal.canReply ? .terminal : .clipboard
@@ -87,8 +143,12 @@ struct AgentSession: Identifiable {
     var canReply: Bool { replyRoute != .none }
 
     var terminalName: String {
+        if kind == .hermes { return "Hermes" }
         let app = terminal?.displayName
-        if herdr != nil { return app.map { "herdr · \($0)" } ?? "herdr" }
+        if herdr != nil {
+            let place = herdrTab ?? "herdr"
+            return app.map { "\(place) · \($0)" } ?? place
+        }
         return app ?? "terminal"
     }
 
@@ -100,6 +160,12 @@ struct AgentSession: Identifiable {
     }
 
     /// Tool calls since the latest prompt.
+    /// Subagents Claude started this turn (its Task / Agent tool), oldest
+    /// first; done when the tool returned.
+    var subagents: [FeedItem] {
+        turnTools.filter { $0.tool == "Task" || $0.tool == "Agent" }
+    }
+
     var turnTools: [FeedItem] {
         let start = feed.lastIndex { $0.kind == .prompt } ?? -1
         return feed[(start + 1)...].filter { $0.kind == .tool }
@@ -119,15 +185,28 @@ enum TabStatus: Hashable {
 
 enum Decision {
     case allow, deny, terminal
+    /// Hermes command approvals: for the rest of this chat, or for good.
+    case allowForChat, allowAlways
+    /// AskUserQuestion: question text → chosen label(s) or typed text.
+    case answer([String: String])
+    /// ExitPlanMode turned down, with what should change.
+    case keepPlanning(String)
 
     /// Hook output for a PermissionRequest. `.terminal` answers with nothing,
-    /// which hands the decision back to the agent's own prompt.
-    var responseBody: Data {
+    /// which hands the decision back to the agent's own prompt. Answers ride
+    /// on `updatedInput`, which replaces the whole tool input, so the
+    /// original questions go back with them.
+    func responseBody(input: [String: JSONValue]) -> Data {
         let decision: [String: Any]
         switch self {
         case .terminal: return Data()
-        case .allow: decision = ["behavior": "allow"]
+        case .allow, .allowForChat, .allowAlways: decision = ["behavior": "allow"]
         case .deny: decision = ["behavior": "deny", "message": "Denied from the notch."]
+        case .answer(let answers):
+            var updated = input.mapValues(\.foundation)
+            updated["answers"] = answers
+            decision = ["behavior": "allow", "updatedInput": updated]
+        case .keepPlanning(let feedback): decision = ["behavior": "deny", "message": feedback]
         }
         let output = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": decision]]
         return (try? JSONSerialization.data(withJSONObject: output)) ?? Data()
@@ -140,15 +219,44 @@ struct Approval: Identifiable {
     let tool: String
     let summary: String
     let detail: String?
-    let reply: HookReply
+    let input: [String: JSONValue]
+    /// What to show: a diff, questions, a plan, or the plain summary.
+    let prompt: PromptKind
+    let channel: Channel
+
+    /// Where the answer goes.
+    enum Channel {
+        /// A Claude Code or Codex hook, waiting on its HTTP request.
+        case hook(HookReply)
+        /// Hermes, over its live socket: a command approval for a chat, or
+        /// a question (`clarify`) by its request id.
+        case hermesApproval(stored: String)
+        case hermesQuestion(requestID: String)
+    }
+
+    var isHermes: Bool {
+        if case .hook = channel { return false }
+        return true
+    }
 }
 
 @MainActor
 final class Store: ObservableObject {
-    @Published private(set) var sessions: [AgentSession] = []
+    /// Published only when something actually changed: herdr, the process
+    /// scan and the terminal watcher rewrite it every few seconds, and
+    /// redrawing the notch for an identical list made animations hitch.
+    private(set) var sessions: [AgentSession] = [] {
+        willSet { if newValue != sessions { objectWillChange.send() } }
+    }
     @Published private(set) var approvals: [Approval] = []
     @Published var selectedID: String?
     @Published private(set) var hooksInstalled = HookInstaller.isInstalled
+    @Published private(set) var hermesConnected = HermesAPI.isConfigured
+    /// Hermes chats with a turn running from the notch: their live events
+    /// own them, so the 15 s poll leaves them alone until the turn ends.
+    private var hermesLive = Set<String>()
+    /// When each session's transcript was last read for its context size.
+    private var contextReadAt: [String: Date] = [:]
     @Published var problem: String?
     /// A passing, non-error message ("Copied, paste with ⌘V").
     @Published private(set) var notice: String?
@@ -183,12 +291,158 @@ final class Store: ObservableObject {
         func rank(_ session: AgentSession) -> Int {
             switch session.status {
             case .working: 0
-            case .waiting: session.fromHooks ? 0 : 1
+            case .waiting where session.fromHooks: 0
+            case .waiting: session.isStaleWait ? 3 : 1
             case .idle: 2
-            case .ended: 3
+            case .ended: 4
             }
         }
         return sessions.sorted { (rank($0), $1.updatedAt) < (rank($1), $0.updatedAt) }
+    }
+
+    // MARK: Thread names
+
+    /// Names the user gave threads, by session id. Kept across launches.
+    private var titles = UserDefaults.standard.dictionary(forKey: "threadTitles") as? [String: String] ?? [:]
+
+    /// Every new session goes through here, so a renamed thread keeps its
+    /// name when its agent comes back (relaunch, herdr rescan).
+    private func add(_ session: AgentSession) {
+        var session = session
+        session.customTitle = titles[session.id]
+        sessions.append(session)
+    }
+
+    /// An empty name goes back to the automatic one (the latest prompt).
+    func rename(_ id: String, to name: String?) {
+        let name = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        titles[id] = name?.isEmpty == false ? name : nil
+        UserDefaults.standard.set(titles, forKey: "threadTitles")
+        if let index = sessions.firstIndex(where: { $0.id == id }) { sessions[index].customTitle = titles[id] }
+    }
+
+    // MARK: Thread tools
+
+    func copySummary(_ id: String) {
+        guard let session = session(id) else { return }
+        copy(ThreadTools.summary(of: session))
+        announce("Copied a summary of \(session.agent)'s run.")
+    }
+
+    func copyDiff(_ id: String) {
+        guard let session = session(id) else { return }
+        Task {
+            do {
+                let diff = try await Task.detached(priority: .userInitiated) { try ThreadTools.diff(of: session) }.value
+                copy(diff.text)
+                announce("Copied the diff of \(diff.files) file\(diff.files == 1 ? "" : "s").")
+            } catch {
+                problem = error.localizedDescription
+            }
+        }
+    }
+
+    func revealTranscript(_ id: String) {
+        guard let session = session(id) else { return }
+        Task {
+            let path = await Task.detached(priority: .userInitiated) { ThreadTools.transcript(of: session) }.value
+            guard let path else {
+                problem = "Couldn't find \(session.agent)'s log for this thread."
+                return
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        }
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // MARK: Hidden threads
+
+    /// Threads the user removed from the list, with when. One comes back
+    /// if it does something new after that. Kept across launches.
+    @Published private(set) var hidden: [String: Date] = (UserDefaults.standard.dictionary(forKey: "hiddenThreads") as? [String: Double] ?? [:])
+        .mapValues { Date(timeIntervalSince1970: $0) }
+
+    /// What Threads lists: everything not hidden.
+    var listedSessions: [AgentSession] {
+        orderedSessions.filter { session in hidden[session.id].map { session.updatedAt > $0 } ?? true }
+    }
+
+    var hiddenCount: Int { sessions.count - listedSessions.count }
+
+    func hide(_ ids: [String]) {
+        let now = Date()
+        for id in ids { hidden[id] = now }
+        saveHidden()
+    }
+
+    func showHidden() {
+        hidden = [:]
+        saveHidden()
+    }
+
+    private func saveHidden() {
+        // Forget entries for sessions that are gone for good.
+        let live = Set(sessions.map(\.id))
+        hidden = hidden.filter { live.contains($0.key) }
+        UserDefaults.standard.set(hidden.mapValues(\.timeIntervalSince1970), forKey: "hiddenThreads")
+    }
+
+    /// Ends the agent itself (closes its herdr pane), then drops the thread.
+    func closeAgent(_ id: String) {
+        guard let pane = session(id)?.herdr else { return }
+        Task {
+            let closed = await Task.detached { Herdr.closePane(pane) }.value
+            if closed { hide([id]) } else { problem = "herdr couldn't close that pane." }
+        }
+    }
+
+    /// Asks the agent to compact its context: `/compact` typed into Claude
+    /// Code or Codex, `session.compress` for Hermes.
+    func compactContext(_ id: String) {
+        guard let session = session(id), session.canCompact else { return }
+        Task {
+            do {
+                switch session.replyRoute {
+                case .hermes:
+                    try await HermesLive.shared.compress(String(id.dropFirst("hermes:".count)))
+                case .herdr:
+                    if let herdr = session.herdr { try await Herdr.prompt("/compact", to: herdr) }
+                case .terminal:
+                    if let terminal = session.terminal { try await TerminalBridge.send("/compact", to: terminal, cwd: session.cwd) }
+                case .clipboard:
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("/compact", forType: .string)
+                    announce("Copied /compact. Paste it into \(session.terminalName) and press Return.")
+                    return
+                case .none:
+                    return
+                }
+                if let index = sessions.firstIndex(where: { $0.id == id }) {
+                    append(FeedItem(kind: .notice, title: "Compacting context"), at: index)
+                }
+                announce("Compacting \(session.agent)'s context…")
+                if session.replyRoute != .hermes { await followCompaction(of: session) }
+            } catch {
+                problem = error.localizedDescription
+            }
+        }
+    }
+
+    /// Sessions without hooks (herdr-only Claude, Codex) say nothing when
+    /// compaction ends, so re-read their log until the ring drops; it takes
+    /// up to a couple of minutes.
+    private func followCompaction(of session: AgentSession) async {
+        let before = session.contextTokens ?? 0
+        for _ in 0..<18 {
+            try? await Task.sleep(for: .seconds(10))
+            guard let current = self.session(session.id) else { return }
+            await loadExchange(for: current)
+            if let tokens = self.session(session.id)?.contextTokens, tokens < before / 2 { return }
+        }
     }
 
     var selected: AgentSession? {
@@ -238,7 +492,14 @@ final class Store: ObservableObject {
             sessions[index].status = .idle
             if let model = payload.model { sessions[index].model = model }
             if let title = payload.sessionTitle, !title.isEmpty { sessions[index].terminalTitle = title }
-            append(FeedItem(kind: .notice, title: "Session started", detail: payload.source), at: index)
+            if payload.source == "compact" {
+                // Claude Code starts over after /compact (its own or ours);
+                // the ring has to drop now, not after the next turn.
+                append(FeedItem(kind: .notice, title: "Context compacted"), at: index)
+                if let path = payload.transcriptPath { readTranscript(for: payload.sessionID, at: path) }
+            } else {
+                append(FeedItem(kind: .notice, title: "Session started", detail: payload.source), at: index)
+            }
         case "UserPromptSubmit":
             settleApprovals(for: payload.sessionID)
             finishRunningTools(at: index)
@@ -254,11 +515,21 @@ final class Store: ObservableObject {
             let tool = payload.toolName ?? "Tool"
             let (summary, detail) = ToolSummary.describe(tool, payload.toolInput)
             sessions[index].status = .working
-            append(FeedItem(kind: .tool, tool: tool, title: summary, detail: detail, toolUseID: payload.toolUseID), at: index)
+            var item = FeedItem(kind: .tool, tool: tool, title: summary, detail: detail, toolUseID: payload.toolUseID)
+            if case .diff(let diffs) = PromptKind.from(tool: tool, input: payload.toolInput ?? [:], cwd: payload.cwd) {
+                item.files = diffs.map(\.path)
+            }
+            append(item, at: index)
         case "PostToolUse", "PostToolUseFailure":
             settleApprovals(for: payload.sessionID)
             sessions[index].status = .working
             markToolDone(payload, failed: payload.event == "PostToolUseFailure", at: index)
+            // Keeps the context ring current through long turns, not just
+            // when they end; every 15 s at most.
+            if let path = payload.transcriptPath, Date().timeIntervalSince(contextReadAt[payload.sessionID] ?? .distantPast) > 15 {
+                contextReadAt[payload.sessionID] = Date()
+                readTranscript(for: payload.sessionID, at: path)
+            }
         case "PermissionRequest":
             enqueueApproval(payload, reply: reply)
             sessions[index].status = .waiting
@@ -303,7 +574,7 @@ final class Store: ObservableObject {
         }
         var session = AgentSession(id: payload.sessionID, kind: payload.agent, cwd: payload.cwd ?? "", terminal: payload.terminal, herdr: payload.herdr)
         session.model = payload.model
-        sessions.append(session)
+        add(session)
         if payload.event != "UserPromptSubmit", let path = payload.transcriptPath {
             recoverPrompt(for: payload.sessionID, transcript: path)
         }
@@ -336,11 +607,25 @@ final class Store: ObservableObject {
     /// Fills in what hooks don't say: the latest prompt (for sessions that
     /// were running before the app started) and the model in use.
     private func readTranscript(for sessionID: String, at path: String) {
+        // Codex's hooks point at its own log, which only has context to give.
+        if session(sessionID)?.kind == .codex {
+            Task.detached(priority: .utility) {
+                let context = AgentLog.context(kind: .codex, path: path)
+                await MainActor.run {
+                    guard let context, let index = self.sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+                    self.sessions[index].contextTokens = context.tokens
+                    self.sessions[index].contextWindow = context.window
+                    if let model = context.model { self.sessions[index].model = model }
+                }
+            }
+            return
+        }
         Task.detached(priority: .utility) {
             let found = Transcript.summary(at: path)
             await MainActor.run {
                 guard let index = self.sessions.firstIndex(where: { $0.id == sessionID }) else { return }
                 if let model = found.model { self.sessions[index].model = model }
+                if let context = found.context { self.sessions[index].contextTokens = context }
                 guard self.sessions[index].prompt == nil, let prompt = found.prompt else { return }
                 self.sessions[index].prompt = prompt.text
                 if self.sessions[index].isBusy, self.sessions[index].turnStartedAt == nil {
@@ -422,7 +707,9 @@ final class Store: ObservableObject {
     private func enqueueApproval(_ payload: HookPayload, reply: HookReply) {
         let tool = payload.toolName ?? "Tool"
         let (summary, detail) = ToolSummary.describe(tool, payload.toolInput)
-        let approval = Approval(sessionID: payload.sessionID, tool: tool, summary: summary, detail: detail, reply: reply)
+        let input = payload.toolInput ?? [:]
+        let approval = Approval(sessionID: payload.sessionID, tool: tool, summary: summary, detail: detail,
+                                input: input, prompt: PromptKind.from(tool: tool, input: input, cwd: payload.cwd), channel: .hook(reply))
         approvals.append(approval)
         let id = approval.id
         reply.onHangUp { [weak self] in
@@ -431,15 +718,36 @@ final class Store: ObservableObject {
     }
 
     func decide(_ approval: Approval, _ decision: Decision) {
-        approval.reply.send(decision.responseBody)
+        switch approval.channel {
+        case .hook(let reply):
+            reply.send(decision.responseBody(input: approval.input))
+        case .hermesApproval(let stored):
+            let choice = switch decision {
+            case .allowForChat: "session"
+            case .allowAlways: "always"
+            case .deny: "deny"
+            default: "once"
+            }
+            respondToHermes { try await HermesLive.shared.approve(stored, choice: choice) }
+        case .hermesQuestion(let requestID):
+            guard case .answer(let answers) = decision else { break }
+            let answer = answers.values.first ?? ""
+            respondToHermes { try await HermesLive.shared.answer(requestID, with: answer) }
+        }
         removeApproval(approval.id)
+    }
+
+    private func respondToHermes(_ send: @escaping () async throws -> Void) {
+        Task {
+            do { try await send() } catch { problem = error.localizedDescription }
+        }
     }
 
     /// The session moved on without us (answered in the terminal, new
     /// prompt, turn ended): release any hook still waiting on the notch.
     private func settleApprovals(for sessionID: String) {
         for approval in approvals where approval.sessionID == sessionID {
-            approval.reply.send()
+            if case .hook(let reply) = approval.channel { reply.send() }
         }
         approvals.removeAll { $0.sessionID == sessionID }
     }
@@ -479,6 +787,8 @@ final class Store: ObservableObject {
                 }
             }
             let text = Attachments.compose(typed.isEmpty ? "Take a look:" : typed, with: attachments)
+            // Sent mid-turn, the agent queues it until it can take it.
+            let queued = session.status == .working && session.replyRoute != .hermes
             do {
                 switch session.replyRoute {
                 case .clipboard:
@@ -496,7 +806,16 @@ final class Store: ObservableObject {
                     }
                 case .terminal:
                     if let terminal = session.terminal {
-                        try await TerminalBridge.send(text, to: terminal)
+                        try await TerminalBridge.send(text, to: terminal, cwd: session.cwd)
+                    }
+                case .hermes:
+                    let stored = String(sessionID.dropFirst("hermes:".count))
+                    beginHermesTurn(sessionID, prompt: text)
+                    do {
+                        try await HermesLive.shared.reply(to: stored, text: text)
+                    } catch {
+                        endHermesTurn(sessionID)
+                        throw error
                     }
                 case .none:
                     return
@@ -504,6 +823,9 @@ final class Store: ObservableObject {
                 drafts[sessionID] = nil
                 replyAttachments[sessionID] = nil
                 problem = nil
+                if queued, let index = sessions.firstIndex(where: { $0.id == sessionID }) {
+                    append(FeedItem(kind: .notice, title: "Queued: \(typed.isEmpty ? "attachments" : typed)"), at: index)
+                }
             } catch {
                 problem = error.localizedDescription
             }
@@ -526,19 +848,29 @@ final class Store: ObservableObject {
             let title = agent.terminalTitle.flatMap(Self.cleanTitle)
             if let index = sessions.firstIndex(where: { $0.id == id }) {
                 sessions[index].herdr = pane
+                sessions[index].herdrTab = agent.tabLabel
                 if let title { sessions[index].terminalTitle = title }
                 if sessions[index].fromHooks {
                     reconcile(index, busy: ["working": true, "idle": false, "done": false][agent.agentStatus])
                 } else {
                     applyHerdrStatus(agent.agentStatus, at: index)
+                    // No hooks to say how a long turn is going: the ring
+                    // follows the log instead, every 15 s at most.
+                    if sessions[index].status == .working,
+                       Date().timeIntervalSince(contextReadAt[id] ?? .distantPast) > 15 {
+                        contextReadAt[id] = Date()
+                        let session = sessions[index]
+                        Task { await loadExchange(for: session) }
+                    }
                 }
             } else {
                 var session = AgentSession(id: id, kind: kind, cwd: agent.cwd ?? "", herdr: pane)
                 session.fromHooks = false
                 session.terminalTitle = title
+                session.herdrTab = agent.tabLabel
                 session.updatedAt = .distantPast
                 session.status = Self.status(fromHerdr: agent.agentStatus)
-                sessions.append(session)
+                add(session)
                 if let index = sessions.firstIndex(where: { $0.id == id }) {
                     sessions[index].agentSessionID = agent.agentSession?.value
                     let session = sessions[index]
@@ -593,6 +925,24 @@ final class Store: ObservableObject {
         guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
         if let prompt = exchange.prompt { sessions[index].prompt = prompt }
         if let reply = exchange.reply { sessions[index].lastReply = reply }
+        if let context = exchange.context {
+            sessions[index].contextTokens = context.tokens
+            sessions[index].contextWindow = context.window
+            // Codex's log has the model it switched to; Claude's hooks report
+            // the id with its "[1m]" window suffix, which the log lacks.
+            if let model = context.model, session.kind == .codex || sessions[index].model == nil {
+                sessions[index].model = model
+            }
+        }
+        // Found already waiting: it began when the agent last wrote its log.
+        // No log at all means its age is unknown (nil), most likely old.
+        if sessions[index].status == .waiting, let since = sessions[index].waitingSince {
+            if let activity = exchange.activity {
+                if activity < since { sessions[index].waitingSince = activity }
+            } else {
+                sessions[index].waitingSince = nil
+            }
+        }
     }
 
     /// "✳ Fix the login bug" -> "Fix the login bug"; Codex's "Task | folder" -> "Task".
@@ -604,6 +954,151 @@ final class Store: ObservableObject {
         if let bar = title.range(of: " | ") { title = String(title[..<bar.lowerBound]) }
         let generic = ["Claude Code", "codex", "Codex", NSUserName()]
         return title.isEmpty || generic.contains(title) ? nil : title
+    }
+
+    // MARK: Hermes
+
+    /// Every 15 s: the Hermes backend's recent chats, as threads. Also
+    /// listens for live events from chats started or answered here.
+    func watchHermes() {
+        Task { [weak self] in
+            await HermesLive.shared.onEvent { event in
+                Task { @MainActor in self?.handleHermes(event) }
+            }
+        }
+        Task { [weak self] in
+            while true {
+                await self?.refreshHermes()
+                try? await Task.sleep(for: .seconds(15))
+            }
+        }
+    }
+
+    func connectHermes() {
+        HermesConnectDialog.present { [weak self] in
+            self?.hermesConnected = true
+            Task { await self?.refreshHermes() }
+        }
+    }
+
+    func disconnectHermes() {
+        hermesConnected = false
+        sessions.removeAll { $0.kind == .hermes }
+        Task { await HermesAPI.shared.disconnect() }
+    }
+
+    private func refreshHermes() async {
+        guard HermesAPI.isConfigured else { return }
+        do {
+            applyHermes(try await HermesAPI.shared.recentChats())
+        } catch {
+            // Mac mini asleep, Tailscale off: keep the last list.
+            EventLog.write("hermes: \(error.localizedDescription)")
+        }
+    }
+
+    /// Asks Hermes in a new chat; returns its thread id.
+    func askHermes(_ text: String) async -> String? {
+        do {
+            let stored = try await HermesLive.shared.ask(text)
+            let id = "hermes:\(stored)"
+            if !sessions.contains(where: { $0.id == id }) {
+                var session = AgentSession(id: id, kind: .hermes, cwd: "")
+                session.fromHooks = false
+                session.origin = "Hermes"
+                add(session)
+            }
+            beginHermesTurn(id, prompt: text)
+            return id
+        } catch {
+            problem = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func beginHermesTurn(_ id: String, prompt: String) {
+        hermesLive.insert(id)
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        finishRunningTools(at: index)
+        sessions[index].prompt = prompt
+        sessions[index].lastReply = nil
+        sessions[index].status = .working
+        sessions[index].turnStartedAt = Date()
+        sessions[index].finishedAt = nil
+        sessions[index].updatedAt = Date()
+        append(FeedItem(kind: .prompt, title: prompt), at: index)
+    }
+
+    private func endHermesTurn(_ id: String) {
+        hermesLive.remove(id)
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        finishRunningTools(at: index)
+        sessions[index].status = .idle
+    }
+
+    private func handleHermes(_ event: HermesEvent) {
+        switch event {
+        case .started(let stored):
+            guard let index = sessions.firstIndex(where: { $0.id == "hermes:\(stored)" }) else { return }
+            sessions[index].status = .working
+        case .tool(let stored, let name, let context):
+            guard let index = sessions.firstIndex(where: { $0.id == "hermes:\(stored)" }) else { return }
+            finishRunningTools(at: index)
+            append(FeedItem(kind: .tool, tool: name, title: context ?? ""), at: index)
+        case .approval(let stored, let command, let description, let choices):
+            let id = "hermes:\(stored)"
+            approvals.append(Approval(sessionID: id, tool: "Hermes", summary: command, detail: description, input: [:],
+                                      prompt: .command(command, description: description, choices: choices),
+                                      channel: .hermesApproval(stored: stored)))
+            if let index = sessions.firstIndex(where: { $0.id == id }) { sessions[index].status = .waiting }
+        case .question(let stored, let requestID, let question):
+            let id = "hermes:\(stored)"
+            approvals.append(Approval(sessionID: id, tool: "Hermes", summary: question.question, detail: nil, input: [:],
+                                      prompt: .questions([question]), channel: .hermesQuestion(requestID: requestID)))
+            if let index = sessions.firstIndex(where: { $0.id == id }) { sessions[index].status = .waiting }
+        case .completed(let stored, let text):
+            let id = "hermes:\(stored)"
+            settleApprovals(for: id)
+            hermesLive.remove(id)
+            guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+            finishRunningTools(at: index)
+            if !text.isEmpty { sessions[index].lastReply = text }
+            sessions[index].updatedAt = Date()
+            markStopped(at: index)
+            append(FeedItem(kind: .finished, title: "Finished"), at: index)
+        case .failed(let stored, let message):
+            settleApprovals(for: "hermes:\(stored)")
+            endHermesTurn("hermes:\(stored)")
+            problem = message
+        }
+    }
+
+    private func applyHermes(_ chats: [HermesChat]) {
+        let ids = Set(chats.map { "hermes:\($0.id)" })
+        // Chats running from the notch stay even if they've left the top few.
+        sessions.removeAll { $0.kind == .hermes && !ids.contains($0.id) && !hermesLive.contains($0.id) }
+        for chat in chats {
+            let id = "hermes:\(chat.id)"
+            guard !hermesLive.contains(id) else { continue }
+            // The list can't say whether a turn is running (Hermes touches a
+            // chat again after replying, e.g. to title it), so polled chats
+            // show as done; "working" comes only from live events.
+            var session = sessions.first { $0.id == id } ?? AgentSession(id: id, kind: .hermes, cwd: "")
+            session.fromHooks = false
+            session.origin = chat.sourceName
+            session.terminalTitle = chat.title
+            session.prompt = chat.prompt ?? chat.title
+            session.lastReply = chat.reply
+            session.model = chat.model
+            session.status = .idle
+            session.updatedAt = chat.lastActive
+            session.finishedAt = chat.lastActive
+            if let index = sessions.firstIndex(where: { $0.id == id }) {
+                sessions[index] = session
+            } else {
+                add(session)
+            }
+        }
     }
 
     // MARK: Other agent CLIs
@@ -634,7 +1129,7 @@ final class Store: ObservableObject {
                 session.status = status
                 session.updatedAt = busy ? Date() : .distantPast
                 if busy { session.turnStartedAt = Date() }
-                sessions.append(session)
+                add(session)
             }
         }
         sessions.removeAll { $0.id.hasPrefix("process:") && !seen.contains($0.id) }

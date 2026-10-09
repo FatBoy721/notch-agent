@@ -2,9 +2,8 @@ import AppKit
 import SwiftUI
 
 /// Timing and the small animated pieces the notch is built from. The
-/// spring, the focus-in and the rim light follow the liquid-glass-screens
-/// motion spec (docs/MOTION_SPEC.md); Reduce Motion gets its calmer spring
-/// and no blur.
+/// spring and the focus-in follow the motion spec (docs/MOTION_SPEC.md);
+/// Reduce Motion gets its calmer spring and no blur.
 enum Motion {
     private static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
@@ -46,8 +45,60 @@ enum Motion {
         )
     }
 
-    /// New rows drop in from just above.
-    static let row = AnyTransition.opacity.combined(with: .offset(y: -4)).animation(.easeOut(duration: 0.3))
+    /// New rows rise into place and come into focus, GlassCode's entrance:
+    /// up 18 pt, blur 10 → 0, fading in, 0.55 s on (0.16, 1, 0.3, 1).
+    static var row: AnyTransition {
+        if reduceMotion { return .opacity.animation(.easeOut(duration: 0.2)) }
+        let entrance = Animation.timingCurve(0.16, 1, 0.3, 1, duration: 0.55)
+        return .asymmetric(
+            insertion: .modifier(active: Defocus(radius: 10, opacity: 0), identity: Defocus(radius: 0, opacity: 1))
+                .combined(with: .offset(y: 18)).animation(entrance),
+            removal: .opacity.animation(.easeOut(duration: 0.15))
+        )
+    }
+
+    /// A row leaving dissolves into drifting dust (GlassCode's "Thanos" exit).
+    static var dust: AnyTransition {
+        if reduceMotion { return .opacity.animation(.easeOut(duration: 0.15)) }
+        return .modifier(active: DustEffect(progress: 1), identity: DustEffect(progress: 0))
+            .animation(.easeOut(duration: 0.85))
+    }
+
+    /// The selection highlight gliding between dock or sidebar items.
+    static let glide = Animation.spring(response: 0.35, dampingFraction: 0.86)
+}
+
+/// The view fades and softens while specks lift off it and drift away.
+private struct DustEffect: ViewModifier, Animatable {
+    var progress: Double
+
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(1 - progress)
+            .blur(radius: progress * 3)
+            .overlay {
+                if progress > 0 && progress < 1 {
+                    Canvas { context, size in
+                        for index in 0..<70 {
+                            // Fixed per-speck randomness, so it drifts rather than flickers.
+                            let a = Double((index &* 7919) % 997) / 997, b = Double((index &* 104_729) % 991) / 991
+                            let start = CGPoint(x: a * size.width, y: b * size.height)
+                            // Specks further right go first, as if blown off.
+                            let local = min(1, max(0, progress * 1.6 - (1 - a) * 0.6))
+                            let point = CGPoint(x: start.x + local * (30 + 50 * b), y: start.y - local * (14 + 30 * a))
+                            context.fill(Path(ellipseIn: CGRect(x: point.x, y: point.y, width: 1.8, height: 1.8)),
+                                         with: .color(.white.opacity(0.7 * (1 - local) * min(1, local * 6))))
+                        }
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
+    }
 }
 
 private struct Defocus: ViewModifier {
@@ -56,27 +107,6 @@ private struct Defocus: ViewModifier {
 
     func body(content: Content) -> some View {
         content.blur(radius: radius).opacity(opacity)
-    }
-}
-
-/// The glass's single hairline of rim light: brightest toward one o'clock,
-/// fading round toward ten and to almost nothing underneath.
-struct RimLight<S: Shape>: View {
-    let shape: S
-
-    var body: some View {
-        shape.stroke(
-            AngularGradient(stops: [
-                .init(color: .white.opacity(0.05), location: 0.0),    // 3 o'clock
-                .init(color: .white.opacity(0.03), location: 0.25),   // 6
-                .init(color: .white.opacity(0.06), location: 0.5),    // 9
-                .init(color: .white.opacity(0.14), location: 0.66),   // 10
-                .init(color: .white.opacity(0.30), location: 0.80),   // 12–1
-                .init(color: .white.opacity(0.12), location: 0.92),   // 2
-                .init(color: .white.opacity(0.05), location: 1.0),
-            ], center: .center),
-            lineWidth: 1
-        )
     }
 }
 
@@ -123,23 +153,34 @@ struct NotchShape: Shape {
 
 // MARK: - Indicators
 
+// The looping marks below run as repeating SwiftUI animations rather than
+// per-frame TimelineViews: an animated scale, offset or opacity is drawn by
+// the render server, while a TimelineView re-runs the view and lays out the
+// whole notch every frame (≈12% CPU for one spinner, and dropped frames in
+// whatever transition runs beside it). Each loop is scoped with
+// `.animation(_:body:)` to just its own scale, opacity, offset or rotation:
+// a plain `.animation(_:value:)` also caught the view's position while a
+// page slid in, and the mark then wandered back and forth forever.
+
 /// A status dot with a soft ring that breathes out from it.
 struct PulseDot: View {
     var color: Color = Palette.accent
     var animated = true
+    @State private var swelling = false
 
     var body: some View {
-        TimelineView(.animation(paused: !animated)) { timeline in
-            let phase = animated ? (timeline.date.timeIntervalSinceReferenceDate / 1.4).truncatingRemainder(dividingBy: 1) : 0
-            let swell = sin(phase * .pi) // 0 → 1 → 0 over one beat
-            ZStack {
-                Circle()
-                    .fill(color.opacity(0.22 * (1 - swell)))
-                    .frame(width: 8 + 6 + 4 * swell, height: 8 + 6 + 4 * swell)
-                Circle().fill(color).frame(width: 8, height: 8)
-            }
-            .frame(width: 18, height: 18)
+        ZStack {
+            Circle()
+                .fill(color.opacity(0.22))
+                .frame(width: 14, height: 14)
+                .animation(animated ? .easeOut(duration: 1.4).repeatForever(autoreverses: false) : .default) {
+                    $0.scaleEffect(swelling ? 18.0 / 14 : 1).opacity(swelling ? 0 : 1)
+                }
+            Circle().fill(color).frame(width: 8, height: 8)
         }
+        .frame(width: 18, height: 18)
+        .onAppear { swelling = animated }
+        .onChange(of: animated) { _, on in swelling = on }
     }
 }
 
@@ -147,23 +188,23 @@ struct PulseDot: View {
 struct ArcSpinner: View {
     var size: CGFloat = 12
     var color: Color = .white
+    @State private var turning = false
 
     var body: some View {
-        TimelineView(.animation) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            let cycle = (t / 1.6).truncatingRemainder(dividingBy: 1)
-            // First half the arc grows, second half its tail chases the head.
-            let head = min(1, cycle * 2) * 0.99
-            let tail = max(0, cycle * 2 - 1) * 0.99
-            ZStack {
-                Circle().stroke(color.opacity(0.2), lineWidth: 2.2)
-                Circle()
-                    .trim(from: tail, to: max(tail + 0.02, head))
-                    .stroke(color, style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
-                    .rotationEffect(.degrees(t / 1.6 * 360 - 90))
-            }
-            .frame(width: size, height: size)
+        ZStack {
+            Circle().stroke(color.opacity(0.2), lineWidth: 2.2)
+            Circle()
+                .trim(from: 0, to: 0.3)
+                .stroke(color, style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                .animation(.linear(duration: 0.9).repeatForever(autoreverses: false)) {
+                    $0.rotationEffect(.degrees(turning ? 270 : -90))
+                }
         }
+        .frame(width: size, height: size)
+        .onAppear { turning = true }
+        // Reset, so a view SwiftUI hides and shows again (same identity,
+        // state kept) starts turning again instead of freezing.
+        .onDisappear { turning = false }
     }
 }
 
@@ -172,22 +213,25 @@ struct LevelBars: View {
     var color: Color = .white
     var playing = true
     var height: CGFloat = 14
-    private static let offsets: [Double] = [0, 0.5, 0.22, 0.72]
+    /// Each bar's head start, so they bounce out of step.
+    private static let offsets: [Double] = [0, 0.45, 0.2, 0.65]
+    @State private var bouncing = false
 
     var body: some View {
-        TimelineView(.animation(paused: !playing)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate / 0.9
-            HStack(spacing: 2) {
-                ForEach(0..<4, id: \.self) { index in
-                    let wave = 0.5 - 0.5 * cos(2 * .pi * (t + Self.offsets[index]))
-                    RoundedRectangle(cornerRadius: 1.5)
-                        .fill(color)
-                        .frame(width: 3, height: height)
-                        .scaleEffect(y: playing ? 0.3 + 0.7 * wave : 0.3, anchor: .center)
-                }
+        HStack(spacing: 2) {
+            ForEach(0..<4, id: \.self) { index in
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(color)
+                    .frame(width: 3, height: height)
+                    .animation(bouncing ? .easeInOut(duration: 0.45).repeatForever(autoreverses: true).delay(Self.offsets[index])
+                                        : .easeOut(duration: 0.3)) {
+                        $0.scaleEffect(y: bouncing ? 1 : 0.3, anchor: .center)
+                    }
             }
-            .frame(height: height)
         }
+        .frame(height: height)
+        .onAppear { bouncing = playing }
+        .onChange(of: playing) { _, on in bouncing = on }
     }
 }
 
@@ -200,6 +244,7 @@ struct AgentKind: Hashable, Sendable {
     static let claude = AgentKind(id: "claude")
     static let codex = AgentKind(id: "codex")
     static let gemini = AgentKind(id: "gemini")
+    static let hermes = AgentKind(id: "hermes")
 
     private struct Style {
         let name: String
@@ -219,12 +264,16 @@ struct AgentKind: Hashable, Sendable {
         "copilot": Style(name: "Copilot", red: 0.62, green: 0.55, blue: 0.95, idle: "◉", frames: ["◉", "◎"]),
         "amp": Style(name: "Amp", red: 0.95, green: 0.42, blue: 0.32, idle: "ϟ", frames: ["ϟ", "⚡︎"]),
         "aider": Style(name: "Aider", red: 0.35, green: 0.85, blue: 0.5, idle: "◆", frames: ["◆", "◇"]),
-        "grok": Style(name: "Grok", red: 0.9, green: 0.9, blue: 0.9, idle: "⊘", frames: ["⊘", "○"]),
+        "grok": Style(name: "Grok Build", red: 0.9, green: 0.9, blue: 0.9, idle: "⊘", frames: ["⊘", "○"]),
+        "muse": Style(name: "Muse Code", red: 0.3, green: 0.55, blue: 1, idle: "✺", frames: ["✺", "✹", "✸", "✹"]),
+        "zcode": Style(name: "ZCode (GLM)", red: 0.4, green: 0.62, blue: 1, idle: "◇", frames: ["◇", "◈"]),
+        "openclaw": Style(name: "OpenClaw", red: 1, green: 0.38, blue: 0.3, idle: "⟡", frames: ["⟡", "✦"]),
         "cline": Style(name: "Cline", red: 0.95, green: 0.95, blue: 0.95, idle: "◈", frames: ["◈", "◇"]),
         "kimi": Style(name: "Kimi", red: 0.45, green: 0.7, blue: 1, idle: "◐", frames: ["◐", "◓", "◑", "◒"]),
         "droid": Style(name: "Droid", red: 0.95, green: 0.6, blue: 0.25, idle: "⬣", frames: ["⬣", "⬡"]),
         "devin": Style(name: "Devin", red: 0.4, green: 0.8, blue: 0.75, idle: "◍", frames: ["◍", "○"]),
         "kiro": Style(name: "Kiro", red: 0.6, green: 0.45, blue: 0.95, idle: "◭", frames: ["◭", "◮"]),
+        "hermes": Style(name: "Hermes", red: 0.96, green: 0.78, blue: 0.36, idle: "☤", frames: ["☤", "✧", "☤", "✦"]),
     ]
 
     private var style: Style {
@@ -249,15 +298,75 @@ struct AgentGlyph: View {
         if kind == .codex {
             CodexMark(busy: busy, size: size * 1.2)
                 .frame(width: size * 1.25, height: size * 1.25)
+        } else if let logo = BrandImage.logo(for: kind) {
+            // Services with a picture for a logo: the picture, breathing
+            // gently while it works.
+            Image(nsImage: logo)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: size * 1.2, height: size * 1.2)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.3))
+                .frame(width: size * 1.25, height: size * 1.25)
+                .animation(busy ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default) {
+                    $0.opacity(busy ? 0.55 : 1)
+                }
+        } else if busy {
+            BusyGlyph(kind: kind, size: size)
         } else {
-            TimelineView(.animation(minimumInterval: 0.12, paused: !busy)) { context in
-                let tick = Int(context.date.timeIntervalSinceReferenceDate / 0.12)
-                Text(busy ? kind.frames[tick % kind.frames.count] : kind.idleGlyph)
-                    .font(.system(size: size, weight: .bold))
-                    .foregroundStyle(kind.color)
-                    .frame(width: size * 1.25, height: size * 1.25)
-            }
+            Text(kind.idleGlyph)
+                .font(.system(size: size, weight: .bold))
+                .foregroundStyle(kind.color)
+                .frame(width: size * 1.25, height: size * 1.25)
         }
+    }
+}
+
+/// A working agent's glyph, stepping through its frames on the shared clock.
+private struct BusyGlyph: View {
+    let kind: AgentKind
+    let size: CGFloat
+    @ObservedObject private var clock = GlyphClock.shared
+    @State private var token = UUID()
+
+    var body: some View {
+        Text(kind.frames[clock.tick % kind.frames.count])
+            .font(.system(size: size, weight: .bold))
+            .foregroundStyle(kind.color)
+            .frame(width: size * 1.25, height: size * 1.25)
+            .onAppear { clock.retain(token) }
+            .onDisappear { clock.release(token) }
+    }
+}
+
+/// One 8 Hz tick shared by every busy glyph, so they all step in the same
+/// frame. Each glyph with its own timer forced its own layout pass of the
+/// notch: dozens a second with a few agents working, and Threads lagged.
+@MainActor
+final class GlyphClock: ObservableObject {
+    static let shared = GlyphClock()
+    @Published private(set) var tick = 0
+    /// The glyphs on screen. A set, not a count: SwiftUI can call onAppear
+    /// twice without onDisappear between during transitions, and a count
+    /// would then never get back to zero and the timer would never stop.
+    private var users = Set<UUID>()
+    private var timer: Timer?
+
+    func retain(_ user: UUID) {
+        users.insert(user)
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick &+= 1 }
+        }
+        // .common keeps it ticking while a list is being scrolled.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func release(_ user: UUID) {
+        users.remove(user)
+        guard users.isEmpty else { return }
+        timer?.invalidate()
+        timer = nil
     }
 }
 
@@ -267,23 +376,31 @@ struct AgentGlyph: View {
 struct CodexMark: View {
     var busy = false
     var size: CGFloat = 18
+    @State private var working = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !busy)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
+        ZStack {
+            CodexCloud()
+                .fill(LinearGradient(colors: [Color(red: 0.73, green: 0.66, blue: 0.98),
+                                              Color(red: 0.42, green: 0.53, blue: 0.97),
+                                              Color(red: 0.2, green: 0.17, blue: 0.95)],
+                                     startPoint: .top, endPoint: .bottom))
+                .animation(working ? .linear(duration: 9).repeatForever(autoreverses: false) : .easeOut(duration: 0.4)) {
+                    $0.rotationEffect(.degrees(working ? 360 : 0))
+                }
+            let stroke = StrokeStyle(lineWidth: max(1.2, size * 0.1), lineCap: .round, lineJoin: .round)
             ZStack {
-                CodexCloud()
-                    .fill(LinearGradient(colors: [Color(red: 0.73, green: 0.66, blue: 0.98),
-                                                  Color(red: 0.42, green: 0.53, blue: 0.97),
-                                                  Color(red: 0.2, green: 0.17, blue: 0.95)],
-                                         startPoint: .top, endPoint: .bottom))
-                    .rotationEffect(.degrees(busy ? (t * 40).truncatingRemainder(dividingBy: 360) : 0))
-                CodexPrompt(cursorOn: !busy || Int(t * 2.2) % 2 == 0)
-                    .stroke(.white.opacity(0.92), style: StrokeStyle(lineWidth: max(1.2, size * 0.1), lineCap: .round, lineJoin: .round))
-                    .frame(width: size * 0.5, height: size * 0.32)
+                CodexPrompt(chevron: true, cursor: false).stroke(.white.opacity(0.92), style: stroke)
+                CodexPrompt(chevron: false, cursor: true).stroke(.white.opacity(0.92), style: stroke)
+                    .animation(working ? .easeInOut(duration: 0.45).repeatForever(autoreverses: true) : .default) {
+                        $0.opacity(working ? 0 : 1)
+                    }
             }
-            .frame(width: size, height: size)
+            .frame(width: size * 0.5, height: size * 0.32)
         }
+        .frame(width: size, height: size)
+        .onAppear { working = busy }
+        .onChange(of: busy) { _, on in working = on }
     }
 }
 
@@ -306,14 +423,17 @@ private struct CodexCloud: Shape {
 
 /// `>_`: the chevron always, the underscore while the cursor is on.
 private struct CodexPrompt: Shape {
-    var cursorOn = true
+    var chevron = true
+    var cursor = true
 
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.3, y: rect.midY))
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-        if cursorOn {
+        if chevron {
+            path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.3, y: rect.midY))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+        if cursor {
             path.move(to: CGPoint(x: rect.minX + rect.width * 0.55, y: rect.maxY))
             path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
         }
@@ -329,28 +449,32 @@ struct ShimmerText: View {
     var weight: Font.Weight = .semibold
     var color: Color = Palette.claude
     var highlight = Color(red: 1, green: 0.82, blue: 0.7)
+    @State private var sweeping = false
 
     var body: some View {
-        TimelineView(.animation) { context in
-            // Sweep from just before the text to just past it, then rest.
-            let cycle = (context.date.timeIntervalSinceReferenceDate / 2.0).truncatingRemainder(dividingBy: 1)
-            let center = -0.3 + cycle * 1.8
-            let label = Text(text).font(.system(size: size, weight: weight))
-            label
-                .foregroundStyle(color)
-                .overlay(
-                    LinearGradient(stops: [
-                        .init(color: highlight.opacity(0), location: max(0, center - 0.18)),
-                        .init(color: highlight, location: min(1, max(0, center))),
-                        .init(color: highlight.opacity(0), location: min(1, center + 0.18)),
-                    ], startPoint: .leading, endPoint: .trailing)
-                    .mask(label)
-                )
-        }
+        let label = Text(text).font(.system(size: size, weight: weight))
+        label
+            .foregroundStyle(color)
+            .overlay(
+                // A bright band slides from before the text to past it, then
+                // starts over; only the slide is animated, never the layout.
+                GeometryReader { proxy in
+                    let band = proxy.size.width * 0.36
+                    LinearGradient(colors: [highlight.opacity(0), highlight, highlight.opacity(0)],
+                                   startPoint: .leading, endPoint: .trailing)
+                        .frame(width: band)
+                        .animation(.linear(duration: 2).repeatForever(autoreverses: false)) {
+                            $0.offset(x: sweeping ? proxy.size.width * 1.5 : -band * 1.5)
+                        }
+                }
+                .mask(label)
+            )
+            .onAppear { sweeping = true }
+            .onDisappear { sweeping = false }
     }
 }
 
-/// A key cap, as in ⌥ Space.
+/// A key cap, as in the ⌥ Space shortcut.
 struct Kbd: View {
     let key: String
 
@@ -413,20 +537,30 @@ enum Activity: Hashable {
 struct CappedScroll<Content: View>: View {
     let maxHeight: CGFloat
     var anchorBottom = false
+    /// Fades the bottom edge while there's more below, so a long list
+    /// doesn't look like it ends at the cut.
+    var fadesOverflow = false
     @ViewBuilder let content: Content
     @State private var contentHeight: CGFloat = 0
+
+    private var overflows: Bool { fadesOverflow && contentHeight > maxHeight }
 
     var body: some View {
         // Measured with onGeometryChange: a preference callback doesn't fire
         // again when a page comes back with the same content height, which
         // left this at 0 while the list still drew past the notch's edge.
-        ScrollView(showsIndicators: false) {
+        ScrollView(showsIndicators: overflows) {
             content
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+                .padding(.bottom, overflows ? 28 : 0)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 - (overflows ? 28 : 0) }
         }
         .defaultScrollAnchor(anchorBottom ? .bottom : .top)
+        .softTopEdge()
         .frame(height: min(contentHeight, maxHeight))
         .clipped()
+        .mask(LinearGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: overflows ? 0.86 : 1),
+                                     .init(color: overflows ? .clear : .black, location: 1)],
+                             startPoint: .top, endPoint: .bottom))
     }
 }
 
@@ -436,54 +570,148 @@ func textWidth(_ text: String, size: CGFloat, weight: NSFont.Weight = .semibold)
     (text as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: weight)]).width.rounded(.up)
 }
 
-// MARK: - Activity grid and glass
+// MARK: - Activity grid
 
 /// A 3×3 grid of dots twinkling out of step: the "working" mark in lists.
 struct ActivityGrid: View {
     var color: Color = Palette.accent
     var animating = true
     private static let phases: [Double] = [0.1, 0.55, 0.3, 0.8, 0.0, 0.65, 0.4, 0.95, 0.2]
+    @State private var twinkling = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: !animating)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate / 1.1
-            VStack(spacing: 1.5) {
-                ForEach(0..<3, id: \.self) { row in
-                    HStack(spacing: 1.5) {
-                        ForEach(0..<3, id: \.self) { column in
-                            let phase = Self.phases[row * 3 + column]
-                            let level = animating ? 0.5 + 0.5 * sin(2 * .pi * (t + phase)) : 0.35
-                            RoundedRectangle(cornerRadius: 0.8)
-                                .fill(color.opacity(0.2 + 0.8 * level))
-                                .frame(width: 3.2, height: 3.2)
-                        }
+        VStack(spacing: 1.5) {
+            ForEach(0..<3, id: \.self) { row in
+                HStack(spacing: 1.5) {
+                    ForEach(0..<3, id: \.self) { column in
+                        let phase = Self.phases[row * 3 + column]
+                        RoundedRectangle(cornerRadius: 0.8)
+                            .fill(color)
+                            .frame(width: 3.2, height: 3.2)
+                            .animation(twinkling ? .easeInOut(duration: 0.55).repeatForever(autoreverses: true).delay(phase * 1.1)
+                                                 : .easeOut(duration: 0.3)) {
+                                $0.opacity(twinkling ? 1 : 0.2 + 0.8 * 0.35)
+                            }
                     }
                 }
             }
         }
+        .onAppear { twinkling = animating }
+        .onChange(of: animating) { _, on in twinkling = on }
     }
 }
 
-/// The notch's look, chosen in ⚙ › Appearance.
-enum NotchAppearance: String, CaseIterable {
-    case glass, black
+// MARK: - Brand images and glass
 
-    static let key = "notchAppearance"
+/// Logos that are pictures: Hermes (Nous Research) and OpenClaw ship in
+/// the app's Resources; Spotify and Music come from the installed apps.
+@MainActor
+enum BrandImage {
+    private static var cache: [String: NSImage] = [:]
 
-    var title: String { self == .glass ? "Glass" : "Full black" }
+    static func logo(for kind: AgentKind) -> NSImage? {
+        ["hermes", "openclaw"].contains(kind.id) ? bundled(kind.id) : nil
+    }
+
+    /// From the app bundle; in a dev build (no bundle) from the repo.
+    static func bundled(_ name: String) -> NSImage? {
+        if let image = cache[name] { return image }
+        let url = Bundle.main.url(forResource: name, withExtension: "png")
+            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .appendingPathComponent("../../packaging/brand/\(name).png").standardized
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        cache[name] = image
+        return image
+    }
+
+    /// An installed app's icon, e.g. Spotify or Music.
+    static func app(_ bundleID: String) -> NSImage? {
+        if let image = cache[bundleID] { return image }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        cache[bundleID] = image
+        return image
+    }
 }
 
 extension View {
-    /// Liquid Glass on macOS 26 and later (darkened so text stays legible
-    /// over anything) when the Glass look is on; a solid fill otherwise.
+    /// GlassCode's surface: Apple's Liquid Glass tinted dark (macOS 26 and
+    /// later), or frosted glass before that.
     @ViewBuilder
-    func notchGlass<S: Shape>(in shape: S, tint: Color = .black.opacity(0.5), fallback: Color = .black.opacity(0.86),
-                              interactive: Bool = false, appearance: NotchAppearance = .glass) -> some View {
-        if appearance == .glass, #available(macOS 26.0, *) {
-            self.glassEffect(.regular.tint(tint).interactive(interactive), in: shape)
+    func liquidGlass<S: Shape>(_ shape: S, tint: Double = 0.4, interactive: Bool = false) -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(.regular.tint(.black.opacity(tint)).interactive(interactive), in: shape)
         } else {
-            self.background(shape.fill(appearance == .black ? .black : fallback))
+            background(GlassBackground(shape: shape))
         }
+    }
+
+    /// GlassCode's rim: a bright hairline along the top inner edge that
+    /// fades down the sides, the cue that reads as glass.
+    func glassRim<S: Shape>(_ shape: S, from start: CGFloat = 0) -> some View {
+        overlay(shape.stroke(LinearGradient(stops: [
+            .init(color: .white.opacity(start > 0 ? 0 : 0.32), location: 0),
+            .init(color: .white.opacity(start > 0 ? 0 : 0.32), location: start),
+            .init(color: .white.opacity(0.22), location: min(1, start + 0.02)),
+            .init(color: .white.opacity(0.07), location: min(1, start + 0.4)),
+            .init(color: .white.opacity(0.05), location: 1),
+        ], startPoint: .top, endPoint: .bottom), lineWidth: 1))
+    }
+
+    /// Liquid Glass draws differently in a focused window (near-solid dark)
+    /// than in an unfocused one (clear). The notch takes focus when clicked,
+    /// for typing, so it flipped between the two; it always draws as
+    /// unfocused, the clear glass.
+    @ViewBuilder
+    func steadyGlass() -> some View {
+        if #available(macOS 15.0, *) {
+            environment(\.appearsActive, false)
+        } else {
+            self
+        }
+    }
+
+    /// Content scrolling under the top edge blurs away softly (macOS 26).
+    @ViewBuilder
+    func softTopEdge() -> some View {
+        if #available(macOS 26.0, *) {
+            scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self
+        }
+    }
+}
+
+/// GlassCode's glass: what's behind the window, blurred, under a dark
+/// translucent fill (so text stays legible over anything), with a hairline
+/// edge.
+struct GlassBackground<S: Shape>: View {
+    let shape: S
+
+    var body: some View {
+        ZStack {
+            BehindWindowBlur().clipShape(shape)
+            shape.fill(Color(red: 28 / 255, green: 28 / 255, blue: 32 / 255).opacity(0.82))
+        }
+        .overlay(shape.stroke(Color.white.opacity(0.07), lineWidth: 1))
+    }
+}
+
+/// The desktop and windows behind, blurred by the window server.
+struct BehindWindowBlur: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = PassThroughEffectView()
+        view.material = .hudWindow
+        view.blendingMode = .behindWindow
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
+
+    /// Never takes clicks; it's only a backdrop.
+    private final class PassThroughEffectView: NSVisualEffectView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
 

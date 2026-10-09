@@ -17,10 +17,13 @@ struct HerdrAgent: Decodable, Sendable {
     let cwd: String?
     let paneID: String
     let terminalTitle: String?
-    let agentSession: AgentSessionID?
+    var agentSession: AgentSessionID?
+    let tabID: String?
+    /// The name of the herdr tab the agent runs in, from `herdr tab list`.
+    var tabLabel: String?
 
     struct AgentSessionID: Decodable, Sendable {
-        let value: String?
+        var value: String?
     }
 
     enum CodingKeys: String, CodingKey {
@@ -30,6 +33,7 @@ struct HerdrAgent: Decodable, Sendable {
         case paneID = "pane_id"
         case terminalTitle = "terminal_title_stripped"
         case agentSession = "agent_session"
+        case tabID = "tab_id"
     }
 
     /// Every agent herdr recognizes (claude, codex, gemini, cursor, opencode,
@@ -64,7 +68,38 @@ enum Herdr {
         }
         guard let output = run(["agent", "list"], socket: socket),
               let reply = try? JSONDecoder().decode(Reply.self, from: Data(output.utf8)) else { return [] }
-        return reply.result.agents.filter { $0.kind != nil }
+        let labels = cachedTabLabels(socket: socket)
+        return reply.result.agents.filter { $0.kind != nil }.map { agent in
+            var agent = agent
+            agent.tabLabel = agent.tabID.flatMap { labels[$0] }
+            return agent
+        }
+    }
+
+    /// Tab names change rarely: refreshed every 10 s rather than on every
+    /// 2 s agent poll, which saves a herdr process launch each time.
+    private nonisolated(unsafe) static var labelCache: [String: (labels: [String: String], at: Date)] = [:]
+
+    private static func cachedTabLabels(socket: String?) -> [String: String] {
+        let key = socket ?? ""
+        if let cached = labelCache[key], Date().timeIntervalSince(cached.at) < 10 { return cached.labels }
+        let labels = tabLabels(socket: socket)
+        labelCache[key] = (labels, Date())
+        return labels
+    }
+
+    /// Tab id → the tab's name as shown in herdr's sidebar.
+    private static func tabLabels(socket: String?) -> [String: String] {
+        struct Reply: Decodable {
+            struct Result: Decodable { let tabs: [Tab] }
+            struct Tab: Decodable { let tab_id: String; let label: String? }
+            let result: Result
+        }
+        guard let output = run(["tab", "list"], socket: socket),
+              let reply = try? JSONDecoder().decode(Reply.self, from: Data(output.utf8)) else { return [:] }
+        return reply.result.tabs.reduce(into: [:]) { labels, tab in
+            if let label = tab.label?.trimmingCharacters(in: .whitespaces), !label.isEmpty { labels[tab.tab_id] = label }
+        }
     }
 
     /// The terminal app the herdr client is running in (Metalterm, Ghostty…),
@@ -137,6 +172,11 @@ enum Herdr {
         }.value
     }
 
+    /// Closes the pane, ending the agent in it.
+    static func closePane(_ pane: HerdrPane) -> Bool {
+        run(["pane", "close", pane.paneID], socket: pane.socket) != nil
+    }
+
     /// Runs the herdr CLI synchronously; call off the main thread.
     private static func run(_ arguments: [String], socket: String?) -> String? {
         guard let binary else { return nil }
@@ -164,6 +204,8 @@ final class HerdrMonitor: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var sockets: [String?] = []
     private var tick = 0
+    /// pane id → Codex session id, re-checked every 10 s (see `CodexPanes`).
+    private var codexSessions: [String: String] = [:]
 
     func start(onSnapshot: @escaping @Sendable (Snapshot) -> Void) {
         guard Herdr.binary != nil else { return }
@@ -178,6 +220,18 @@ final class HerdrMonitor: @unchecked Sendable {
             for socket in self.sockets {
                 for agent in Herdr.agents(socket: socket) {
                     snapshot.append((HerdrPane(paneID: agent.paneID, socket: socket), agent))
+                }
+            }
+            if snapshot.contains(where: { $0.agent.kind == .codex }) {
+                if self.tick % 5 == 1 { self.codexSessions = CodexPanes.sessions() }
+                let resolved = Set(self.codexSessions.values)
+                for index in snapshot.indices where snapshot[index].agent.kind == .codex {
+                    if let id = self.codexSessions[snapshot[index].pane.paneID] {
+                        snapshot[index].agent.agentSession = .init(value: id)
+                    } else if let guess = snapshot[index].agent.agentSession?.value, resolved.contains(guess) {
+                        // herdr's guess is another pane's session.
+                        snapshot[index].agent.agentSession = nil
+                    }
                 }
             }
             onSnapshot(snapshot)

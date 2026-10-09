@@ -2,29 +2,36 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>NotchAgent</string>
-    <key>CFBundleDisplayName</key>
-    <string>Notch Agent</string>
-    <key>CFBundleIdentifier</key>
-    <string>dev.notchagent.NotchAgent</string>
-    <key>CFBundleExecutable</key>
-    <string>NotchAgent</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Notch Agent types your replies into Terminal and iTerm2, reads Claude's status from their tabs, and shows and controls what's playing in Music or Spotify.</string>
+	<key>CFBundleDisplayName</key>
+	<string>Notch Agent</string>
+	<key>CFBundleExecutable</key>
+	<string>NotchAgent</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.notchagent.NotchAgent</string>
+	<key>CFBundleName</key>
+	<string>NotchAgent</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Notch Agent types your replies into Terminal and iTerm2, reads Claude's status from their tabs, and shows and controls what's playing in Music or Spotify.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Notch Agent connects to Hermes on your other Mac (over your local network or Tailscale) to show its chats.</string>
 </dict>
 </plist>
